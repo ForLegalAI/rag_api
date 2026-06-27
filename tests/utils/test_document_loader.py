@@ -50,10 +50,11 @@ def test_safe_pdf_loader_class():
     """Test that SafePyPDFLoader class can be instantiated"""
     from app.utils.document_loader import SafePyPDFLoader
 
-    # Test instantiation
+    # Test instantiation. Mistral OCR does not extract images, so the
+    # extract_images flag is accepted for backward compatibility but forced off.
     loader = SafePyPDFLoader("dummy.pdf", extract_images=True)
     assert loader.filepath == "dummy.pdf"
-    assert loader.extract_images == True
+    assert loader.extract_images is False
     assert loader._temp_filepath is None
 
 
@@ -97,81 +98,103 @@ def test_safe_pdf_loader_lazy_load():
     assert isinstance(result, Iterator)
 
 
-def test_safe_pdf_loader_fallback_no_duplicate_pages():
-    """Fallback after mid-stream KeyError must not duplicate already-yielded pages."""
+def _make_mistral_module(pages=None, raise_exc=None):
+    """Build a fake ``mistralai`` module whose ``Mistral().ocr.process`` is stubbed.
+
+    Returns ``(fake_module, client)`` so callers can both inject the module via
+    ``sys.modules`` and make assertions on the OCR client.
+    """
+    fake_module = MagicMock()
+    client = MagicMock()
+    if raise_exc is not None:
+        client.ocr.process.side_effect = raise_exc
+    else:
+        response = MagicMock()
+        response.pages = pages
+        client.ocr.process.return_value = response
+    fake_module.Mistral.return_value = client
+    return fake_module, client
+
+
+def test_safe_pdf_loader_ocr_maps_pages():
+    """load() maps Mistral OCR pages to Documents with their page index in metadata."""
+    from app.utils import document_loader
     from app.utils.document_loader import SafePyPDFLoader
 
-    fallback_docs = [Document(page_content=f"fallback page {i}") for i in range(5)]
+    page0 = MagicMock(index=0, markdown="page zero text")
+    page1 = MagicMock(index=1, markdown="page one text")
+    fake_module, client = _make_mistral_module(pages=[page0, page1])
 
-    def primary_gen():
-        yield Document(page_content="partial page 0")
-        yield Document(page_content="partial page 1")
-        raise KeyError("/Filter")
-
-    def fallback_gen():
-        yield from fallback_docs
-
-    loader = SafePyPDFLoader("dummy.pdf", extract_images=True)
-
-    with patch("app.utils.document_loader.PyPDFLoader") as MockPDF:
-        primary_instance = MagicMock()
-        primary_instance.lazy_load.side_effect = primary_gen
-        fallback_instance = MagicMock()
-        fallback_instance.lazy_load.side_effect = fallback_gen
-        MockPDF.side_effect = [primary_instance, fallback_instance]
-
-        result = list(loader.lazy_load())
-
-    # Must be exactly the 5 fallback pages, NOT 2 partial + 5 fallback = 7
-    assert len(result) == 5
-    assert result[0].page_content == "fallback page 0"
-    assert result[-1].page_content == "fallback page 4"
-
-
-def test_safe_pdf_loader_fallback_via_load():
-    """load() delegates to lazy_load(), so fallback must also be correct via load()."""
-    from app.utils.document_loader import SafePyPDFLoader
-
-    fallback_docs = [Document(page_content=f"fb {i}") for i in range(3)]
-
-    def primary_gen():
-        yield Document(page_content="partial 0")
-        raise KeyError("/Filter")
-
-    def fallback_gen():
-        yield from fallback_docs
-
-    loader = SafePyPDFLoader("dummy.pdf", extract_images=True)
-
-    with patch("app.utils.document_loader.PyPDFLoader") as MockPDF:
-        primary_instance = MagicMock()
-        primary_instance.lazy_load.side_effect = primary_gen
-        fallback_instance = MagicMock()
-        fallback_instance.lazy_load.side_effect = fallback_gen
-        MockPDF.side_effect = [primary_instance, fallback_instance]
-
+    loader = SafePyPDFLoader("dummy.pdf")
+    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+        document_loader, "MISTRAL_API_KEY", "test-key"
+    ), patch.object(SafePyPDFLoader, "_encode_pdf_b64", return_value="b64data"):
         result = loader.load()
 
-    assert len(result) == 3
-    assert result[0].page_content == "fb 0"
+    assert [d.page_content for d in result] == ["page zero text", "page one text"]
+    assert result[0].metadata == {"source": "dummy.pdf", "page": 0}
+    assert result[1].metadata == {"source": "dummy.pdf", "page": 1}
+    client.ocr.process.assert_called_once()
 
 
-def test_safe_pdf_loader_non_filter_error_propagates():
-    """KeyError that isn't /Filter should propagate, not silently fallback."""
+def test_safe_pdf_loader_lazy_load_yields_ocr_pages():
+    """lazy_load() yields the same Documents that load() produces."""
     from app.utils.document_loader import SafePyPDFLoader
 
-    def bad_gen():
-        raise KeyError("SomeOtherKey")
+    docs = [Document(page_content="p1"), Document(page_content="p2")]
+    loader = SafePyPDFLoader("dummy.pdf")
+    with patch.object(SafePyPDFLoader, "load", return_value=docs):
+        result = list(loader.lazy_load())
 
-    loader = SafePyPDFLoader("dummy.pdf", extract_images=True)
+    assert result == docs
 
-    with patch("app.utils.document_loader.PyPDFLoader") as MockPDF:
-        instance = MagicMock()
-        instance.lazy_load.side_effect = bad_gen
-        MockPDF.return_value = instance
 
-        with pytest.raises(KeyError, match="SomeOtherKey"):
-            list(loader.lazy_load())
+def test_safe_pdf_loader_empty_pages_returns_placeholder():
+    """An OCR response with no pages yields a single empty placeholder Document."""
+    from app.utils import document_loader
+    from app.utils.document_loader import SafePyPDFLoader
+
+    fake_module, _ = _make_mistral_module(pages=[])
+
+    loader = SafePyPDFLoader("dummy.pdf")
+    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+        document_loader, "MISTRAL_API_KEY", "test-key"
+    ), patch.object(SafePyPDFLoader, "_encode_pdf_b64", return_value="b64data"):
+        result = loader.load()
+
+    assert len(result) == 1
+    assert result[0].page_content == ""
+    assert result[0].metadata == {"source": "dummy.pdf", "page": 1}
+
+
+def test_safe_pdf_loader_ocr_error_propagates():
+    """An error raised by the Mistral OCR API call propagates to the caller."""
+    from app.utils import document_loader
+    from app.utils.document_loader import SafePyPDFLoader
+
+    fake_module, _ = _make_mistral_module(raise_exc=RuntimeError("OCR boom"))
+
+    loader = SafePyPDFLoader("dummy.pdf")
+    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+        document_loader, "MISTRAL_API_KEY", "test-key"
+    ), patch.object(SafePyPDFLoader, "_encode_pdf_b64", return_value="b64data"):
+        with pytest.raises(RuntimeError, match="OCR boom"):
+            loader.load()
+
+
+def test_safe_pdf_loader_requires_api_key():
+    """load() raises a clear error when MISTRAL_API_KEY is not configured."""
+    from app.utils import document_loader
+    from app.utils.document_loader import SafePyPDFLoader
+
+    fake_module, _ = _make_mistral_module(pages=[])
+
+    loader = SafePyPDFLoader("dummy.pdf")
+    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+        document_loader, "MISTRAL_API_KEY", ""
+    ):
+        with pytest.raises(RuntimeError, match="MISTRAL_API_KEY"):
+            loader.load()
 
 
 MARKDOWN_SAMPLE = (
