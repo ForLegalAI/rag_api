@@ -59,6 +59,17 @@ POSTGRES_USER = get_env_variable("POSTGRES_USER", "myuser")
 POSTGRES_PASSWORD = get_env_variable("POSTGRES_PASSWORD", "mypassword")
 DB_HOST = get_env_variable("DB_HOST", "db")
 DB_PORT = get_env_variable("DB_PORT", "5432")
+PGVECTOR_CREATE_EXTENSION = get_env_variable(
+    "PGVECTOR_CREATE_EXTENSION", "True"
+).lower() in ("true", "1", "yes", "on")
+PG_POOL_PRE_PING = get_env_variable("PG_POOL_PRE_PING", "True").lower() in (
+    "true",
+    "1",
+    "yes",
+    "on",
+)
+PG_POOL_RECYCLE = int(get_env_variable("PG_POOL_RECYCLE", "-1"))
+POSTGRES_SCHEMA = get_env_variable("POSTGRES_SCHEMA", None) or None
 COLLECTION_NAME = get_env_variable("COLLECTION_NAME", "testcollection")
 ATLAS_MONGO_DB_URI = get_env_variable(
     "ATLAS_MONGO_DB_URI", "mongodb://127.0.0.1:27018/LibreChat"
@@ -69,6 +80,23 @@ MONGO_VECTOR_COLLECTION = get_env_variable(
 )  # Deprecated, backwards compatability
 CHUNK_SIZE = int(get_env_variable("CHUNK_SIZE", "1500"))
 CHUNK_OVERLAP = int(get_env_variable("CHUNK_OVERLAP", "100"))
+
+# Batch processing configuration for memory-constrained environments.
+# When EMBEDDING_BATCH_SIZE > 0, documents are processed in batches to reduce
+# peak memory usage. This is useful for Kubernetes pods with memory limits.
+#
+# Trade-offs:
+# - Smaller batch size = lower memory, more DB round trips
+# - Larger batch size = higher memory, fewer DB round trips
+# - 0 = disable batching, process all at once
+#
+# Default of 500 is conservative and works well for most embedding providers.
+# Increase to 750 for higher throughput at the cost of higher peak memory.
+EMBEDDING_BATCH_SIZE = int(get_env_variable("EMBEDDING_BATCH_SIZE", "500"))
+
+# Maximum number of batches to buffer in memory during async processing.
+# Higher values allow more parallelism but use more memory.
+EMBEDDING_MAX_QUEUE_SIZE = int(get_env_variable("EMBEDDING_MAX_QUEUE_SIZE", "3"))
 
 env_value = get_env_variable("PDF_EXTRACT_IMAGES", "False").lower()
 PDF_EXTRACT_IMAGES = True if env_value == "true" else False
@@ -199,14 +227,24 @@ MISTRAL_OCR_MODEL = get_env_variable("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
 env_value = get_env_variable("RAG_CHECK_EMBEDDING_CTX_LENGTH", "True").lower()
 RAG_CHECK_EMBEDDING_CTX_LENGTH = True if env_value == "true" else False
 
+# Only parse RAG_DISTANCE_THRESHOLD when it will actually be applied (pgvector).
+# Under atlas-mongo the setting is documented as ignored, so parsing it
+# unconditionally would turn a stale/non-numeric value into a hard boot failure
+# for an unrelated backend.
+RAG_DISTANCE_THRESHOLD = None
+if VECTOR_DB_TYPE == VectorDBType.PGVECTOR:
+    _distance_threshold_raw = get_env_variable("RAG_DISTANCE_THRESHOLD", None)
+    if _distance_threshold_raw not in (None, ""):
+        RAG_DISTANCE_THRESHOLD = float(_distance_threshold_raw)
+
 ## Embeddings
 
 
-def init_embeddings(provider, model):
+def init_embeddings(provider, model, dimensions=None):
     if provider == EmbeddingsProvider.OPENAI:
         from langchain_openai import OpenAIEmbeddings
 
-        return OpenAIEmbeddings(
+        kwargs = dict(
             model=model,
             api_key=RAG_OPENAI_API_KEY,
             openai_api_base=RAG_OPENAI_BASEURL,
@@ -214,10 +252,13 @@ def init_embeddings(provider, model):
             chunk_size=EMBEDDINGS_CHUNK_SIZE,
             check_embedding_ctx_length=RAG_CHECK_EMBEDDING_CTX_LENGTH,
         )
+        if dimensions is not None:
+            kwargs["dimensions"] = dimensions
+        return OpenAIEmbeddings(**kwargs)
     elif provider == EmbeddingsProvider.AZURE:
         from langchain_openai import AzureOpenAIEmbeddings
 
-        return AzureOpenAIEmbeddings(
+        kwargs = dict(
             azure_deployment=model,
             api_key=RAG_AZURE_OPENAI_API_KEY,
             azure_endpoint=RAG_AZURE_OPENAI_ENDPOINT,
@@ -225,6 +266,9 @@ def init_embeddings(provider, model):
             chunk_size=EMBEDDINGS_CHUNK_SIZE,
             check_embedding_ctx_length=RAG_CHECK_EMBEDDING_CTX_LENGTH,
         )
+        if dimensions is not None:
+            kwargs["dimensions"] = dimensions
+        return AzureOpenAIEmbeddings(**kwargs)
     elif provider == EmbeddingsProvider.HUGGINGFACE:
         from langchain_huggingface import HuggingFaceEmbeddings
 
@@ -244,12 +288,18 @@ def init_embeddings(provider, model):
 
         return GoogleGenerativeAIEmbeddings(
             model=model,
-            google_api_key=RAG_GOOGLE_API_KEY,
+            google_api_key=RAG_GOOGLE_API_KEY or None,
         )
     elif provider == EmbeddingsProvider.GOOGLE_VERTEXAI:
-        from langchain_google_vertexai import VertexAIEmbeddings
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-        return VertexAIEmbeddings(model=model)
+        return GoogleGenerativeAIEmbeddings(
+            model=model,
+            google_api_key=RAG_GOOGLE_API_KEY or None,
+            vertexai=True,
+            project=get_env_variable("GOOGLE_CLOUD_PROJECT", None),
+            location=get_env_variable("GOOGLE_CLOUD_LOCATION", "us-central1"),
+        )
     elif provider == EmbeddingsProvider.BEDROCK:
         from langchain_aws import BedrockEmbeddings
 
@@ -276,6 +326,18 @@ EMBEDDINGS_PROVIDER = EmbeddingsProvider(
     get_env_variable("EMBEDDINGS_PROVIDER", EmbeddingsProvider.OPENAI.value).lower()
 )
 
+# Only parse EMBEDDINGS_DIMENSIONS for providers that honor it (OpenAI / Azure).
+# Parsing unconditionally at import would turn an unrelated stale env var
+# (e.g. EMBEDDINGS_DIMENSIONS=foo left over from an OpenAI deployment) into a
+# hard boot failure under bedrock / hf / ollama / etc., even though those
+# providers silently ignore the value.
+EMBEDDINGS_DIMENSIONS = None
+
+if EMBEDDINGS_PROVIDER in (EmbeddingsProvider.OPENAI, EmbeddingsProvider.AZURE):
+    _embeddings_dimensions_raw = get_env_variable("EMBEDDINGS_DIMENSIONS", None)
+    if _embeddings_dimensions_raw not in (None, ""):
+        EMBEDDINGS_DIMENSIONS = int(_embeddings_dimensions_raw)
+
 if EMBEDDINGS_PROVIDER == EmbeddingsProvider.OPENAI:
     EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "text-embedding-3-small")
     # 1000 is the default chunk size for OpenAI, but this causes API rate limits to be hit
@@ -293,7 +355,7 @@ elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.HUGGINGFACETEI:
         "EMBEDDINGS_MODEL", "http://huggingfacetei:3000"
     )
 elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.GOOGLE_VERTEXAI:
-    EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "text-embedding-004")
+    EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "gemini-embedding-001")
 elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.OLLAMA:
     EMBEDDINGS_MODEL = get_env_variable("EMBEDDINGS_MODEL", "nomic-embed-text")
 elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.GOOGLE_GENAI:
@@ -306,7 +368,9 @@ elif EMBEDDINGS_PROVIDER == EmbeddingsProvider.BEDROCK:
 else:
     raise ValueError(f"Unsupported embeddings provider: {EMBEDDINGS_PROVIDER}")
 
-embeddings = init_embeddings(EMBEDDINGS_PROVIDER, EMBEDDINGS_MODEL)
+embeddings = init_embeddings(
+    EMBEDDINGS_PROVIDER, EMBEDDINGS_MODEL, dimensions=EMBEDDINGS_DIMENSIONS
+)
 
 logger.info(f"Initialized embeddings of type: {type(embeddings)}")
 
@@ -317,6 +381,10 @@ if VECTOR_DB_TYPE == VectorDBType.PGVECTOR:
         embeddings=embeddings,
         collection_name=COLLECTION_NAME,
         mode="async",
+        create_extension=PGVECTOR_CREATE_EXTENSION,
+        pool_pre_ping=PG_POOL_PRE_PING,
+        pool_recycle=PG_POOL_RECYCLE,
+        schema=POSTGRES_SCHEMA,
     )
 elif VECTOR_DB_TYPE == VectorDBType.ATLAS_MONGO:
     # Backward compatability check

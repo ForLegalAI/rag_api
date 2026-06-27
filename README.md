@@ -34,6 +34,33 @@ pip install -r requirements.txt
 uvicorn main:app
 ```
 
+### Clean Install (Local Development)
+
+To do a clean reinstall of all dependencies (e.g., after updating `requirements.txt`):
+
+```bash
+# Remove existing virtual environment and recreate it
+rm -rf venv
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+For the lite version (without sentence_transformers/huggingface):
+
+```bash
+rm -rf venv
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.lite.txt
+```
+
+For Docker, rebuild without cache:
+
+```bash
+docker compose build --no-cache
+```
+
 ### Environment Variables
 
 The following environment variables are required to run the application:
@@ -50,6 +77,10 @@ The following environment variables are required to run the application:
 - `POSTGRES_PASSWORD`: (Optional) The password for connecting to the PostgreSQL database.
 - `DB_HOST`: (Optional) The hostname or IP address of the PostgreSQL database server.
 - `DB_PORT`: (Optional) The port number of the PostgreSQL database server.
+- `PGVECTOR_CREATE_EXTENSION`: (Optional) Set to "False" to skip the `CREATE EXTENSION IF NOT EXISTS vector` call on startup. Default is "True". Use this when the `vector` extension is already installed on a managed Postgres (e.g. RDS, Azure Database for PostgreSQL) and the application user is not a superuser.
+- `PG_POOL_PRE_PING`: (Optional) Set to "False" to disable SQLAlchemy's pre-ping check. Default is "True". When enabled, the connection pool issues a lightweight `SELECT 1` before handing out a pooled connection, so stale connections dropped by a remote server or middlebox idle timeout are transparently replaced instead of surfacing as query errors. Recommended for any deployment that connects to a remote PostgreSQL instance (managed Postgres, connections that traverse a load balancer, etc.).
+- `PG_POOL_RECYCLE`: (Optional) Maximum age in seconds of a pooled connection before it is recycled. Default is "-1" (disabled). Set to a positive value when the server enforces a hard idle or max-lifetime limit (e.g. "1800" for a 30-minute cap).
+- `POSTGRES_SCHEMA`: (Optional) Prepend this schema to the Postgres `search_path` so langchain's pgvector tables live in (and are read from) it. Unset by default (uses the user's default schema, typically `public`). Useful when sharing a database with other services — create the schema out-of-band first (`CREATE SCHEMA IF NOT EXISTS <name>; GRANT USAGE, CREATE ON SCHEMA <name> TO <app_user>;`); the RAG API will not create it for you and fails fast at startup if the schema is missing. `public` is always appended to the resulting search path so the `vector` data type stays resolvable when the extension was installed there (the common case). Multiple schemas may be supplied as a comma-separated list (e.g. `myapp,extensions`) when the `vector` extension lives in a non-`public` schema.
 - `RAG_HOST`: (Optional) The hostname or IP address where the API server will run. Defaults to "0.0.0.0"
 - `RAG_PORT`: (Optional) The port number where the API server will run. Defaults to port 8000.
 - `JWT_SECRET`: (Optional) The secret key used for verifying JWT tokens for requests.
@@ -59,6 +90,9 @@ The following environment variables are required to run the application:
 - `COLLECTION_NAME`: (Optional) The name of the collection in the vector store. Default value is "testcollection".
 - `CHUNK_SIZE`: (Optional) The size of the chunks for text processing. Default value is "1500".
 - `CHUNK_OVERLAP`: (Optional) The overlap between chunks during text processing. Default value is "100".
+- `EMBEDDING_BATCH_SIZE`: (Optional) Number of document chunks to process per batch. Set to `0` (default) to disable batching. Recommended value is `750` for `text-embedding-3-small`.
+- `EMBEDDING_MAX_QUEUE_SIZE`: (Optional) Maximum number of batches to buffer in memory during async processing. Default value is "3".
+- `RAG_DISTANCE_THRESHOLD`: (Optional, `VECTOR_DB_TYPE=pgvector` only) Drop results whose vector distance is greater than this value, after the top-`k` search. Unset by default (no filtering). Lower distance = more similar, so e.g. `0.5` keeps only hits with distance ≤ 0.5 and discards weaker matches. Useful for reducing downstream LLM token cost when the top-`k` call returns loosely-related chunks. Appropriate values depend on the embedding model and distance strategy — inspect your actual scores before choosing one. Ignored (with a startup warning) under `VECTOR_DB_TYPE=atlas-mongo`, because Atlas returns a similarity score (higher = better) with inverted semantics.
 - `RAG_UPLOAD_DIR`: (Optional) The directory where uploaded files are stored. Default value is "./uploads/".
 - `PDF_EXTRACT_IMAGES`: (Optional) A boolean value indicating whether to extract images from PDF files. Default value is "False".
 - `DEBUG_RAG_API`: (Optional) Set to "True" to show more verbose logging output in the server console, and to enable postgresql database routes
@@ -71,10 +105,12 @@ The following environment variables are required to run the application:
     - azure: "text-embedding-3-small" (will be used as your Azure Deployment)
     - huggingface: "sentence-transformers/all-MiniLM-L6-v2"
     - huggingfacetei: "http://huggingfacetei:3000". Hugging Face TEI uses model defined on TEI service launch.
-    - vertexai: "text-embedding-004"
+    - vertexai: "gemini-embedding-001"
     - ollama: "nomic-embed-text"
     - bedrock: "amazon.titan-embed-text-v1"
     - google_genai: "gemini-embedding-001"
+- `EMBEDDINGS_CHUNK_SIZE`: (Optional) The chunk size used by the OpenAI and Azure embeddings clients to limit the number of inputs per request. Default value is `200`.
+- `EMBEDDINGS_DIMENSIONS`: (Optional) Output vector size to request from the embedding model. Only honored by the `openai` and `azure` providers, and only supported by `text-embedding-3-*` models. Leave unset to use the model's native dimensionality (1536 for `text-embedding-3-small`, 3072 for `text-embedding-3-large`). Setting a smaller value (e.g. `512`, `1024`) trades some retrieval quality for lower storage cost and faster similarity search. Note: do not change this on an existing collection — all vectors in a `pgvector` column must share the same dimensionality.
 - `RAG_AZURE_OPENAI_API_VERSION`: (Optional) Default is `2023-05-15`. The version of the Azure OpenAI API.
 - `RAG_AZURE_OPENAI_API_KEY`: (Optional) The API key for Azure OpenAI service.
     - Note: `AZURE_OPENAI_API_KEY` will work but `RAG_AZURE_OPENAI_API_KEY` will override it in order to not conflict with LibreChat setting.
@@ -90,10 +126,47 @@ The following environment variables are required to run the application:
 - `AWS_SECRET_ACCESS_KEY`: (Optional) needed for bedrock embeddings
 - `GOOGLE_API_KEY`, `GOOGLE_KEY`, `RAG_GOOGLE_API_KEY`: (Optional) Google API key for Google GenAI embeddings. Priority order: RAG_GOOGLE_API_KEY > GOOGLE_KEY > GOOGLE_API_KEY
 - `AWS_SESSION_TOKEN`: (Optional) may be needed for bedrock embeddings
-- `GOOGLE_APPLICATION_CREDENTIALS`: (Optional) needed for Google VertexAI embeddings. This should be a path to a service account credential file in JSON format, as accepted by [langchain](https://python.langchain.com/api_reference/google_vertexai/index.html)
+- `GOOGLE_APPLICATION_CREDENTIALS`: (Optional) needed for Google VertexAI embeddings. This should be a path to a service account credential file in JSON format.
+- `GOOGLE_CLOUD_PROJECT`: (Optional) Google Cloud project ID, needed for VertexAI embeddings.
+- `GOOGLE_CLOUD_LOCATION`: (Optional) Google Cloud region for VertexAI embeddings. Defaults to `us-central1`.
 - `RAG_CHECK_EMBEDDING_CTX_LENGTH` (Optional) Default is true, disabling this will send raw input to the embedder, use this for custom embedding models.
 
 Make sure to set these environment variables before running the application. You can set them in a `.env` file or as system environment variables.
+
+### Embedding Batch Processing
+
+For large files, you can enable batched embedding processing to reduce memory consumption. This is particularly useful in memory-constrained environments like Kubernetes pods with memory limits.
+
+#### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EMBEDDING_BATCH_SIZE` | `0` | Number of document chunks to process per batch. `0` disables batching (original behavior). |
+| `EMBEDDING_MAX_QUEUE_SIZE` | `3` | Maximum number of batches to buffer in memory during async processing. |
+
+#### Recommended Settings
+
+For `text-embedding-3-small` model:
+- `EMBEDDING_BATCH_SIZE=750` - Good balance of throughput and memory
+
+For memory-constrained environments (< 2GB RAM):
+- `EMBEDDING_BATCH_SIZE=100-250`
+
+For high-throughput environments:
+- `EMBEDDING_BATCH_SIZE=1000-2000`
+- `EMBEDDING_MAX_QUEUE_SIZE=5`
+
+#### Behavior
+
+When `EMBEDDING_BATCH_SIZE > 0`:
+- Documents are processed in batches of the specified size
+- Each batch is embedded and inserted before the next batch starts
+- On failure, successfully inserted documents are rolled back
+- Memory usage is bounded by `EMBEDDING_BATCH_SIZE * EMBEDDING_MAX_QUEUE_SIZE`
+
+When `EMBEDDING_BATCH_SIZE = 0` (default):
+- All documents are processed at once (original behavior)
+- Better for small files or memory-rich environments
 
 ### Use Atlas MongoDB as Vector Database
 
@@ -126,6 +199,16 @@ The `ATLAS_MONGO_DB_URI` could be the same or different from what is used by Lib
 ```
 
 Follow one of the [four documented methods](https://www.mongodb.com/docs/atlas/atlas-vector-search/create-index/#procedure) to create the vector index.
+
+#### Create a `file_id` Index (recommended)
+
+We recommend creating a standard MongoDB index on `file_id` to keep lookups fast. After creating the collection, run the following once (via Atlas UI, Compass, or `mongosh`):
+
+```javascript
+db.getCollection("<COLLECTION_NAME>").createIndex({ file_id: 1 })
+```
+
+Replace `<COLLECTION_NAME>` with the same collection used by the RAG API. This ensures lookups remain fast even as the number of embedded documents grows.
 
 
 ### Proxy Configuration
@@ -168,6 +251,81 @@ Notes:
   * If you do not enable the extension, rag_api service will throw an error that it cannot create the extension due to the note above.
 
 ### Dev notes:
+
+#### Running Tests
+
+##### Prerequisites
+
+Install test dependencies:
+
+```bash
+pip install -r test_requirements.txt
+```
+
+##### Running All Tests
+
+```bash
+# Run all tests
+pytest
+
+# Run with verbose output
+pytest -v
+
+# Run with coverage (if pytest-cov is installed)
+pytest --cov=app
+```
+
+##### Running Specific Test Files
+
+```bash
+# Run batch processing unit tests
+pytest tests/test_batch_processing.py -v
+
+# Run batch processing integration tests (memory optimization tests)
+pytest tests/test_batch_processing_integration.py -v
+
+# Run main API tests
+pytest tests/test_main.py -v
+```
+
+##### Running Tests by Category
+
+```bash
+# Run only integration tests (marked with @pytest.mark.integration)
+pytest -m integration -v
+
+# Skip integration tests
+pytest -m "not integration" -v
+
+# Run only async tests
+pytest -k "async" -v
+```
+
+##### Test Categories
+
+| Test File | Description |
+|-----------|-------------|
+| `test_batch_processing.py` | Unit tests for batch processing functions |
+| `test_batch_processing_integration.py` | Memory optimization and integration tests |
+| `test_main.py` | API endpoint tests |
+| `test_config.py` | Configuration tests |
+| `test_middleware.py` | Middleware tests |
+| `test_models.py` | Model tests |
+
+##### Memory Optimization Tests
+
+The `test_batch_processing_integration.py` file includes tests that verify the memory optimization behavior:
+
+- **`test_memory_bounded_by_batch_size`**: Verifies that the number of documents in memory at any time is bounded by `EMBEDDING_BATCH_SIZE`
+- **`test_memory_tracking_with_tracemalloc`**: Uses Python's `tracemalloc` to monitor memory usage during batch processing
+- **`test_sync_memory_bounded_by_batch_size`**: Same verification for the synchronous code path
+
+Run memory tests specifically:
+
+```bash
+pytest tests/test_batch_processing_integration.py::TestMemoryOptimization -v
+pytest tests/test_batch_processing_integration.py::TestSyncBatchedMemory -v
+```
 
 #### Installing pre-commit formatter
 
