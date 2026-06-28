@@ -16,7 +16,6 @@ from app.config import (
     RAG_PORT,
     CHUNK_SIZE,
     CHUNK_OVERLAP,
-    PDF_EXTRACT_IMAGES,
     VECTOR_DB_TYPE,
     LogMiddleware,
     logger,
@@ -86,7 +85,6 @@ app.middleware("http")(security_middleware)
 # Set state variables for use in routes
 app.state.CHUNK_SIZE = CHUNK_SIZE
 app.state.CHUNK_OVERLAP = CHUNK_OVERLAP
-app.state.PDF_EXTRACT_IMAGES = PDF_EXTRACT_IMAGES
 
 # Include routers
 app.include_router(document_routes.router)

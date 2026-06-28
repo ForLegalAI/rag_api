@@ -50,11 +50,8 @@ def test_safe_pdf_loader_class():
     """Test that SafePyPDFLoader class can be instantiated"""
     from app.utils.document_loader import SafePyPDFLoader
 
-    # Test instantiation. Mistral OCR does not extract images, so the
-    # extract_images flag is accepted for backward compatibility but forced off.
-    loader = SafePyPDFLoader("dummy.pdf", extract_images=True)
+    loader = SafePyPDFLoader("dummy.pdf")
     assert loader.filepath == "dummy.pdf"
-    assert loader.extract_images is False
     assert loader._temp_filepath is None
 
 
@@ -92,7 +89,7 @@ def test_safe_pdf_loader_lazy_load():
     """Test that SafePyPDFLoader.lazy_load() returns an Iterator."""
     from app.utils.document_loader import SafePyPDFLoader
 
-    loader = SafePyPDFLoader("dummy.pdf", extract_images=False)
+    loader = SafePyPDFLoader("dummy.pdf")
     assert hasattr(loader, "lazy_load")
     result = loader.lazy_load()
     assert isinstance(result, Iterator)

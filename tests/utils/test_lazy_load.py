@@ -469,7 +469,7 @@ def test_safe_pdf_loader_lazy_load_is_iterator(tmp_path):
     pdf_path = tmp_path / "gen_test.pdf"
     _make_pdf(str(pdf_path))
 
-    loader = SafePyPDFLoader(str(pdf_path), extract_images=False)
+    loader = SafePyPDFLoader(str(pdf_path))
     result = loader.lazy_load()
     assert isinstance(result, Iterator)
 
@@ -484,8 +484,8 @@ def test_safe_pdf_loader_load_delegates_to_lazy_load(tmp_path):
     pdf_path = tmp_path / "delegate_test.pdf"
     _make_pdf(str(pdf_path))
 
-    loader1 = SafePyPDFLoader(str(pdf_path), extract_images=False)
-    loader2 = SafePyPDFLoader(str(pdf_path), extract_images=False)
+    loader1 = SafePyPDFLoader(str(pdf_path))
+    loader2 = SafePyPDFLoader(str(pdf_path))
 
     with _mock_mistral_ocr(num_pages=3):
         load_docs = loader1.load()
@@ -586,7 +586,7 @@ class TestMemoryBenchmarkPDF:
         """Streaming lazy_load() should use <= peak memory vs load()."""
 
         def factory():
-            return SafePyPDFLoader(pdf_path, extract_images=False)
+            return SafePyPDFLoader(pdf_path)
 
         load_docs, peak_load = _measure_load(factory)
         texts, peak_lazy_stream = _measure_lazy_load_streaming(factory)

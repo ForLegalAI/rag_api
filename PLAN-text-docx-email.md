@@ -194,8 +194,9 @@ elif file_ext == "msg" or file_content_type == "application/vnd.ms-outlook":
   per frame. The PDF OCR path is unchanged (no embedded-image extraction). Factored a
   shared `_run_mistral_ocr()` helper used by both the PDF and image loaders. New
   dependency: `Pillow>=10.0.0`.
-  - Note: `PDF_EXTRACT_IMAGES` remains a dead/no-op config (separate cleanup, left as-is
-    per the decision to keep the PDF path untouched).
+  - Cleanup: removed the dead/no-op `PDF_EXTRACT_IMAGES` config + env var + README entry,
+    and the vestigial `extract_images` param on `SafePyPDFLoader` (it was hardcoded off
+    and unused). The PDF OCR behavior is unchanged.
 
 ## Implementation status — DONE
 - `app/config.py`: `DOCX_TEXT_USE_PANDOC`, `DOCX_TEXT_TRACK_CHANGES`, `EMAIL_INCLUDE_HEADERS`.

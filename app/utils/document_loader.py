@@ -11,7 +11,6 @@ from langchain_core.documents import Document
 
 from app.config import (
     known_source_ext,
-    PDF_EXTRACT_IMAGES,
     CHUNK_OVERLAP,
     logger,
     MISTRAL_API_KEY,
@@ -117,7 +116,7 @@ def get_loader(
     # File Content Type reference:
     # ref.: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/MIME_types/Common_types
     if file_ext == "pdf" or file_content_type == "application/pdf":
-        loader = SafePyPDFLoader(filepath, extract_images=PDF_EXTRACT_IMAGES)
+        loader = SafePyPDFLoader(filepath)
     elif file_ext == "csv" or file_content_type == "text/csv":
         # Detect encoding for CSV files
         encoding = detect_file_encoding(filepath)
@@ -355,13 +354,11 @@ class SafePyPDFLoader:
     - metadata.source: original filepath
     - metadata.page: 1-based page index
 
-    Images are not extracted.
+    Images embedded in the PDF are not extracted.
     """
 
-    def __init__(self, filepath: str, extract_images: bool = False):
+    def __init__(self, filepath: str):
         self.filepath = filepath
-        # kept for backward compatibility (unused, images are not extracted)
-        self.extract_images = False
         self._temp_filepath = None  # For compatibility with cleanup function
 
     def _encode_pdf_b64(self) -> str:
