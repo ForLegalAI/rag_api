@@ -392,6 +392,109 @@ def test_pandoc_docx_loader_lazy_load_yields_from_load(tmp_path):
     assert result == docs
 
 
+def _make_docx_with_header_footer(path, header, footer, body="Body paragraph."):
+    from docx import Document as Docx
+
+    doc = Docx()
+    section = doc.sections[0]
+    section.header.paragraphs[0].text = header
+    section.footer.paragraphs[0].text = footer
+    doc.add_paragraph(body)
+    doc.save(path)
+
+
+def test_extract_docx_headers_footers(tmp_path):
+    from app.utils.document_loader import _extract_docx_headers_footers
+
+    p = tmp_path / "doc.docx"
+    _make_docx_with_header_footer(
+        str(p), "PRIVILEGED & CONFIDENTIAL", "Matter No. 12345"
+    )
+
+    block = _extract_docx_headers_footers(str(p))
+    assert "[Header] PRIVILEGED & CONFIDENTIAL" in block
+    assert "[Footer] Matter No. 12345" in block
+
+
+def test_extract_docx_headers_footers_handles_bad_file(tmp_path):
+    """Non-docx input must not raise; returns an empty string so body load survives."""
+    from app.utils.document_loader import _extract_docx_headers_footers
+
+    p = tmp_path / "bad.docx"
+    p.write_bytes(b"not a real docx")
+    assert _extract_docx_headers_footers(str(p)) == ""
+
+
+def test_pandoc_docx_loader_prepends_headers_footers(tmp_path):
+    from app.utils.document_loader import PandocDocxLoader
+
+    p = tmp_path / "doc.docx"
+    _make_docx_with_header_footer(
+        str(p), "PRIVILEGED & CONFIDENTIAL", "Matter No. 12345"
+    )
+
+    fake_pypandoc = MagicMock()
+    fake_pypandoc.convert_file.return_value = "Body markdown from pandoc."
+
+    loader = PandocDocxLoader(str(p), include_headers_footers=True)
+    with patch.dict("sys.modules", {"pypandoc": fake_pypandoc}):
+        docs = loader.load()
+
+    text = docs[0].page_content
+    assert "PRIVILEGED & CONFIDENTIAL" in text
+    assert "Matter No. 12345" in text
+    assert "Body markdown from pandoc." in text
+    # Header/footer block precedes the pandoc body
+    assert text.index("PRIVILEGED") < text.index("Body markdown")
+
+
+def test_pandoc_docx_loader_headers_footers_disabled(tmp_path):
+    from app.utils.document_loader import PandocDocxLoader
+
+    p = tmp_path / "doc.docx"
+    _make_docx_with_header_footer(str(p), "CONFIDENTIAL", "Matter No. 999")
+
+    fake_pypandoc = MagicMock()
+    fake_pypandoc.convert_file.return_value = "Body markdown only."
+
+    loader = PandocDocxLoader(str(p), include_headers_footers=False)
+    with patch.dict("sys.modules", {"pypandoc": fake_pypandoc}):
+        docs = loader.load()
+
+    assert docs[0].page_content == "Body markdown only."
+    assert "CONFIDENTIAL" not in docs[0].page_content
+
+
+# ---------------------------------------------------------------------------
+# RTF (.rtf)
+# ---------------------------------------------------------------------------
+
+
+def test_get_loader_rtf(tmp_path):
+    from langchain_community.document_loaders import UnstructuredRTFLoader
+
+    file_path = tmp_path / "brief.rtf"
+    file_path.write_text(r"{\rtf1 hello}", encoding="utf-8")
+
+    loader, known_type, file_ext = get_loader(
+        "brief.rtf", "application/rtf", str(file_path)
+    )
+    assert isinstance(loader, UnstructuredRTFLoader)
+    assert known_type is True
+    assert file_ext == "rtf"
+
+
+def test_get_loader_rtf_not_hijacked_by_markdown_mime(tmp_path):
+    """A markdown Content-Type must not route .rtf into the markdown loader."""
+    from langchain_community.document_loaders import UnstructuredRTFLoader
+
+    file_path = tmp_path / "brief.rtf"
+    file_path.write_text(r"{\rtf1 hello}", encoding="utf-8")
+
+    loader, _, _ = get_loader("brief.rtf", "text/markdown", str(file_path))
+    assert isinstance(loader, UnstructuredRTFLoader)
+
+
 # ---------------------------------------------------------------------------
 # Email (.eml / .msg)
 # ---------------------------------------------------------------------------

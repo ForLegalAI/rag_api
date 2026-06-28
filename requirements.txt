@@ -18,6 +18,7 @@ networkx==3.2.1
 pandas==2.2.1
 openpyxl==3.1.5
 docx2txt==0.9
+python-docx==1.1.2  # .docx header/footer extraction (pandoc drops them)
 pypandoc==1.15
 python-oxmsg>=0.0.2  # .msg (Outlook) extraction; also a transitive of unstructured
 PyJWT==2.13.0

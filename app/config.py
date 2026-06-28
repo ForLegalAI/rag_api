@@ -233,6 +233,11 @@ DOCX_TEXT_USE_PANDOC = (
     get_env_variable("DOCX_TEXT_USE_PANDOC", "True").lower() == "true"
 )
 DOCX_TEXT_TRACK_CHANGES = get_env_variable("DOCX_TEXT_TRACK_CHANGES", "all")
+# Prepend document headers/footers (matter numbers, "PRIVILEGED & CONFIDENTIAL",
+# "DRAFT", etc.) to the pandoc-extracted .docx text, since pandoc drops them.
+DOCX_TEXT_INCLUDE_HEADERS_FOOTERS = (
+    get_env_variable("DOCX_TEXT_INCLUDE_HEADERS_FOOTERS", "True").lower() == "true"
+)
 
 # Email (.eml/.msg) extraction: prepend key headers (From/To/Subject/Date) to the
 # extracted body text so downstream parsing has the message context.

@@ -18,6 +18,7 @@ from app.config import (
     MISTRAL_OCR_MODEL,
     DOCX_TEXT_USE_PANDOC,
     DOCX_TEXT_TRACK_CHANGES,
+    DOCX_TEXT_INCLUDE_HEADERS_FOOTERS,
     EMAIL_INCLUDE_HEADERS,
 )
 from langchain_community.document_loaders import (
@@ -28,6 +29,7 @@ from langchain_community.document_loaders import (
     UnstructuredMarkdownLoader,
     UnstructuredXMLLoader,
     UnstructuredRSTLoader,
+    UnstructuredRTFLoader,
     UnstructuredExcelLoader,
     UnstructuredPowerPointLoader,
     UnstructuredEmailLoader,
@@ -36,9 +38,10 @@ from langchain_community.document_loaders import (
 
 # Extensions that identify binary file formats handled by dedicated loaders.
 # Used to prevent a conflicting multipart Content-Type (e.g. ``text/markdown``)
-# from hijacking these files into a text loader.
+# from hijacking these files into a text loader. RTF is markup (not plain text),
+# so it belongs here too.
 _BINARY_FILE_EXTENSIONS = frozenset(
-    {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "epub", "msg"}
+    {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "epub", "msg", "rtf"}
 )
 
 
@@ -141,6 +144,8 @@ def get_loader(
             loader = CSVLoader(filepath)
     elif file_ext == "rst":
         loader = UnstructuredRSTLoader(filepath, mode="elements")
+    elif file_ext == "rtf" or file_content_type in ["application/rtf", "text/rtf"]:
+        loader = UnstructuredRTFLoader(filepath)
     elif file_ext == "xml" or file_content_type in [
         "application/xml",
         "text/xml",
@@ -384,19 +389,69 @@ def _combine_headers_and_body(header_block: str, body: str) -> str:
     return header_block or body
 
 
+def _extract_docx_headers_footers(filepath: str) -> str:
+    """Extract distinct header/footer text from a .docx via python-docx.
+
+    pandoc drops .docx headers/footers, but in legal documents they carry
+    significant content (matter numbers, "PRIVILEGED & CONFIDENTIAL", "DRAFT").
+    Returns a block of ``[Header] ...`` / ``[Footer] ...`` lines, deduplicated
+    across sections and first/even-page variants. Returns "" on any failure so
+    body extraction is never blocked.
+    """
+    try:
+        from docx import Document as DocxDocument
+    except Exception as e:
+        logger.warning(f"python-docx unavailable; skipping header/footer extraction: {e}")
+        return ""
+
+    try:
+        doc = DocxDocument(filepath)
+    except Exception as e:
+        logger.warning(f"Failed to read .docx headers/footers for {filepath}: {e}")
+        return ""
+
+    lines = []
+    seen = set()
+    for section in doc.sections:
+        parts = (
+            (section.header, "Header"),
+            (section.first_page_header, "Header"),
+            (section.even_page_header, "Header"),
+            (section.footer, "Footer"),
+            (section.first_page_footer, "Footer"),
+            (section.even_page_footer, "Footer"),
+        )
+        for hf, label in parts:
+            text = "\n".join(p.text for p in hf.paragraphs).strip()
+            if text and text not in seen:
+                seen.add(text)
+                lines.append(f"[{label}] {text}")
+    return "\n".join(lines)
+
+
 class PandocDocxLoader:
     """Load a ``.docx`` via pandoc so tracked changes and comments are preserved.
 
     Used by the ``/text`` endpoint (``raw_text=True``); the embedding path keeps
     using ``Docx2txtLoader``. Produces a single :class:`Document` whose
     ``page_content`` is pandoc Markdown. ``track_changes`` maps to pandoc's
-    ``--track-changes`` flag (``all`` keeps insertions/deletions and emits
-    comments). pandoc only reads OOXML ``.docx``, not legacy binary ``.doc``.
+    ``--track-changes`` flag (``all`` keeps insertions/deletions and, with the
+    Markdown output used here, records each edit's author/date plus comments).
+    pandoc only reads OOXML ``.docx``, not legacy binary ``.doc``.
+
+    When ``include_headers_footers`` is enabled, header/footer text (which pandoc
+    drops) is extracted separately via python-docx and prepended to the body.
     """
 
-    def __init__(self, filepath: str, track_changes: str = DOCX_TEXT_TRACK_CHANGES):
+    def __init__(
+        self,
+        filepath: str,
+        track_changes: str = DOCX_TEXT_TRACK_CHANGES,
+        include_headers_footers: bool = DOCX_TEXT_INCLUDE_HEADERS_FOOTERS,
+    ):
         self.filepath = filepath
         self.track_changes = track_changes
+        self.include_headers_footers = include_headers_footers
         self._temp_filepath = None  # For compatibility with cleanup function
 
     def load(self) -> List[Document]:
@@ -416,6 +471,11 @@ class PandocDocxLoader:
             format="docx",
             extra_args=[f"--track-changes={self.track_changes}", "--wrap=none"],
         )
+
+        if self.include_headers_footers:
+            header_block = _extract_docx_headers_footers(self.filepath)
+            text = _combine_headers_and_body(header_block, text)
+
         return [Document(page_content=text, metadata={"source": self.filepath})]
 
     def lazy_load(self) -> Iterator[Document]:

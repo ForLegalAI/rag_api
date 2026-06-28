@@ -175,6 +175,20 @@ elif file_ext == "msg" or file_content_type == "application/vnd.ms-outlook":
 5. **Scope** → DOCX-via-pandoc on **`/text` only** (gated by `raw_text=True` and
    `DOCX_TEXT_USE_PANDOC`, default `True`); embedding path keeps `Docx2txtLoader`.
 
+## Follow-up additions (this round)
+- **DOCX edit author/date + comments** — already delivered by the original choice
+  (Markdown output + `--track-changes=all`): pandoc records each insertion/
+  deletion/comment span's `author`/`date`. No code change; documented above.
+- **DOCX headers/footers** — pandoc drops them, so they're extracted separately via
+  **python-docx** and prepended to the `/text` output (matter numbers,
+  "PRIVILEGED & CONFIDENTIAL", "DRAFT"). Toggle: `DOCX_TEXT_INCLUDE_HEADERS_FOOTERS`
+  (default `True`). Fails soft (returns "" on any read error).
+- **`.rtf` support** — routed to `UnstructuredRTFLoader` (pandoc-backed; already in
+  Docker). Added to `_BINARY_FILE_EXTENSIONS` so a stray `text/markdown` MIME can't
+  hijack it. New dependency: `python-docx==1.1.2` (MIT).
+- **`.wpd` (WordPerfect)** — explicitly **out of scope** (no Python lib; would need
+  the `libwpd` system binary in Docker; niche format).
+
 ## Implementation status — DONE
 - `app/config.py`: `DOCX_TEXT_USE_PANDOC`, `DOCX_TEXT_TRACK_CHANGES`, `EMAIL_INCLUDE_HEADERS`.
 - `app/utils/document_loader.py`: new `PandocDocxLoader`, `EmailLoader`,
