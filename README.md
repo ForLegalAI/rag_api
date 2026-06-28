@@ -1,5 +1,17 @@
 ﻿# ID-based RAG FastAPI
 
+> ## About this fork
+>
+> This is a fork of [danny-avila/rag_api](https://github.com/danny-avila/rag_api), tailored for legal-office document workflows. It keeps full upstream compatibility (same API, same LibreChat integration) while changing how several document types are loaded and adding new ones. **Key differences from upstream:**
+>
+> - **Remote OCR via Mistral** — PDFs and standalone images (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.tif`/`.tiff`, `.webp`) are OCR'd through the [Mistral OCR API](https://docs.mistral.ai/) instead of a bundled local OCR engine. Set `MISTRAL_API_KEY` to enable. Because OCR is remote, the local OCR/computer-vision stack (`rapidocr-onnxruntime`, `opencv`, `onnxruntime`) has been **removed**, which also makes the image considerably smaller.
+> - **Richer DOCX text extraction** — `.docx` files routed to `/text` are converted with [pandoc](https://pandoc.org/), preserving tracked changes, comments, and (optionally) headers/footers. Configurable via `DOCX_TEXT_USE_PANDOC`, `DOCX_TEXT_TRACK_CHANGES`, and `DOCX_TEXT_INCLUDE_HEADERS_FOOTERS`.
+> - **Email support** — `.eml` and `.msg` (Outlook) files are parsed, with sender/recipient/subject/date headers optionally prepended (`EMAIL_INCLUDE_HEADERS`). Bcc is never exposed.
+> - **`.rtf` support** added.
+> - **Legacy `.doc` is rejected** with a clear error asking the user to convert to `.docx` (the old binary format could not be loaded reliably).
+>
+> **Prebuilt image:** [`georgx22/rag_api_lite`](https://hub.docker.com/r/georgx22/rag_api_lite) on Docker Hub — the lite build (no local embedding stack; uses remote embeddings + remote Mistral OCR).
+
 ## Overview
 This project integrates Langchain with FastAPI in an Asynchronous, Scalable manner, providing a framework for document indexing and retrieval, using PostgreSQL/pgvector.
 
@@ -94,7 +106,7 @@ The following environment variables are required to run the application:
 - `EMBEDDING_MAX_QUEUE_SIZE`: (Optional) Maximum number of batches to buffer in memory during async processing. Default value is "3".
 - `RAG_DISTANCE_THRESHOLD`: (Optional, `VECTOR_DB_TYPE=pgvector` only) Drop results whose vector distance is greater than this value, after the top-`k` search. Unset by default (no filtering). Lower distance = more similar, so e.g. `0.5` keeps only hits with distance ≤ 0.5 and discards weaker matches. Useful for reducing downstream LLM token cost when the top-`k` call returns loosely-related chunks. Appropriate values depend on the embedding model and distance strategy — inspect your actual scores before choosing one. Ignored (with a startup warning) under `VECTOR_DB_TYPE=atlas-mongo`, because Atlas returns a similarity score (higher = better) with inverted semantics.
 - `RAG_UPLOAD_DIR`: (Optional) The directory where uploaded files are stored. Default value is "./uploads/".
-- `DOCX_TEXT_USE_PANDOC`: (Optional) Boolean. When "True" (default), `.docx` files sent to the `/text` endpoint are converted via **pandoc** so tracked changes and comments are preserved (output is Markdown). The embedding path always uses `Docx2txtLoader`, and legacy `.doc` files are unaffected (pandoc only reads OOXML `.docx`). Requires the `pandoc` binary (already installed in the provided Docker images).
+- `DOCX_TEXT_USE_PANDOC`: (Optional) Boolean. When "True" (default), `.docx` files sent to the `/text` endpoint are converted via **pandoc** so tracked changes and comments are preserved (output is Markdown). The embedding path always uses `Docx2txtLoader`. Pandoc only reads OOXML `.docx`; legacy binary `.doc` files are rejected with an error asking you to convert to `.docx`. Requires the `pandoc` binary (already installed in the provided Docker images).
 - `DOCX_TEXT_TRACK_CHANGES`: (Optional) pandoc `--track-changes` mode for the `.docx` `/text` path: `all` (default; keep insertions/deletions, record each edit's author/date, and emit comments), `accept` (final text), or `reject` (original text).
 - `DOCX_TEXT_INCLUDE_HEADERS_FOOTERS`: (Optional) Boolean. When "True" (default), `.docx` headers/footers (matter numbers, "PRIVILEGED & CONFIDENTIAL", "DRAFT", etc.) — which pandoc drops — are extracted via python-docx and prepended to the `/text` output.
 - `EMAIL_INCLUDE_HEADERS`: (Optional) Boolean. When "True" (default), the From/To/Cc/Subject/Date headers are prepended to extracted email text for `.eml` and `.msg` files. Set "False" to extract the body only.
