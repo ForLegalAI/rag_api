@@ -188,6 +188,14 @@ elif file_ext == "msg" or file_content_type == "application/vnd.ms-outlook":
   hijack it. New dependency: `python-docx==1.1.2` (MIT).
 - **`.wpd` (WordPerfect)** — explicitly **out of scope** (no Python lib; would need
   the `libwpd` system binary in Docker; niche format).
+- **Standalone image OCR** — image uploads (`.png/.jpg/.jpeg/.gif/.bmp/.tif/.tiff/.webp`)
+  now run through Mistral OCR via a new `ImageOCRLoader`, normalized to PNG with Pillow
+  so any format works; **multi-page TIFF** (discovery productions) yields one Document
+  per frame. The PDF OCR path is unchanged (no embedded-image extraction). Factored a
+  shared `_run_mistral_ocr()` helper used by both the PDF and image loaders. New
+  dependency: `Pillow>=10.0.0`.
+  - Note: `PDF_EXTRACT_IMAGES` remains a dead/no-op config (separate cleanup, left as-is
+    per the decision to keep the PDF path untouched).
 
 ## Implementation status — DONE
 - `app/config.py`: `DOCX_TEXT_USE_PANDOC`, `DOCX_TEXT_TRACK_CHANGES`, `EMAIL_INCLUDE_HEADERS`.

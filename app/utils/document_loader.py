@@ -36,12 +36,19 @@ from langchain_community.document_loaders import (
 )
 
 
+# Standalone raster image formats routed to OCR. SVG is excluded (vector/text,
+# not raster-OCR friendly).
+_IMAGE_EXTENSIONS = frozenset(
+    {"png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp"}
+)
+
 # Extensions that identify binary file formats handled by dedicated loaders.
 # Used to prevent a conflicting multipart Content-Type (e.g. ``text/markdown``)
 # from hijacking these files into a text loader. RTF is markup (not plain text),
-# so it belongs here too.
-_BINARY_FILE_EXTENSIONS = frozenset(
-    {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "epub", "msg", "rtf"}
+# so it belongs here too, as do raster image formats.
+_BINARY_FILE_EXTENSIONS = (
+    frozenset({"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "epub", "msg", "rtf"})
+    | _IMAGE_EXTENSIONS
 )
 
 
@@ -188,6 +195,16 @@ def get_loader(
         loader = EmailLoader(filepath)
     elif file_ext == "msg" or file_content_type == "application/vnd.ms-outlook":
         loader = OutlookMsgLoader(filepath)
+    elif file_ext in _IMAGE_EXTENSIONS or file_content_type in [
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/bmp",
+        "image/tiff",
+        "image/webp",
+    ]:
+        # Standalone images (scanned exhibits, screenshots) run through OCR.
+        loader = ImageOCRLoader(filepath)
     elif file_ext in ["xls", "xlsx"] or file_content_type in [
         "application/vnd.ms-excel",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -268,6 +285,67 @@ def process_documents(documents: List[Document]) -> str:
     return processed_text.strip()
 
 
+def _run_mistral_ocr(build_document, source: str) -> List[Document]:
+    """Run Mistral OCR for a document/image payload and map pages to Documents.
+
+    Shared by the PDF and image loaders. ``build_document`` is a no-arg callable
+    returning the OCR ``document`` payload (e.g. a base64 data URL); it is
+    invoked only after the API-key check passes, so encoding work is skipped
+    when OCR can't run. Returns one Document per page (1-based ``page``
+    metadata), or a single empty placeholder when the response has no pages.
+    """
+    # Lazy import to avoid hard dependency at import time
+    try:
+        from mistralai import Mistral
+    except Exception as e:
+        raise RuntimeError(
+            "mistralai package is required for OCR. Please install 'mistralai' and set MISTRAL_API_KEY."
+        ) from e
+
+    if not MISTRAL_API_KEY:
+        raise RuntimeError(
+            "MISTRAL_API_KEY is not set. Please configure it in environment variables."
+        )
+
+    client = Mistral(api_key=MISTRAL_API_KEY)
+
+    try:
+        ocr_response = client.ocr.process(
+            model=MISTRAL_OCR_MODEL,
+            document=build_document(),
+            include_image_base64=False,
+        )
+    except Exception as e:
+        logger.error(f"Mistral OCR API call failed: {e}")
+        raise
+
+    pages = getattr(ocr_response, "pages", None)
+    # Some clients return dict-like response; handle both
+    if pages is None and isinstance(ocr_response, dict):
+        pages = ocr_response.get("pages")
+
+    if not pages:
+        # Return an empty single document to avoid downstream crashes
+        return [Document(page_content="", metadata={"source": source, "page": 1})]
+
+    documents: List[Document] = []
+    for page in pages:
+        # Handle both object and dict access
+        index = getattr(page, "index", None) if not isinstance(page, dict) else page.get("index")
+        markdown = getattr(page, "markdown", None) if not isinstance(page, dict) else page.get("markdown")
+        if index is None:
+            # Default to 1-based index progression
+            index = len(documents) + 1
+        documents.append(
+            Document(
+                page_content=markdown or "",
+                metadata={"source": source, "page": index},
+            )
+        )
+
+    return documents
+
+
 class SafePyPDFLoader:
     """
     Replacement for previous PyPDF-based loader that now uses Mistral OCR API.
@@ -293,69 +371,13 @@ class SafePyPDFLoader:
             return base64.b64encode(f.read()).decode("utf-8")
 
     def load(self) -> List[Document]:
-        # Lazy import to avoid hard dependency at import time
-        try:
-            from mistralai import Mistral
-        except Exception as e:
-            raise RuntimeError(
-                "mistralai package is required for PDF OCR. Please install 'mistralai' and set MISTRAL_API_KEY."
-            ) from e
-
-        if not MISTRAL_API_KEY:
-            raise RuntimeError(
-                "MISTRAL_API_KEY is not set. Please configure it in environment variables."
-            )
-
-        base64_pdf = self._encode_pdf_b64()
-        client = Mistral(api_key=MISTRAL_API_KEY)
-
-        try:
-            ocr_response = client.ocr.process(
-                model=MISTRAL_OCR_MODEL,
-                document={
-                    "type": "document_url",
-                    "document_url": f"data:application/pdf;base64,{base64_pdf}",
-                },
-                include_image_base64=False,
-            )
-        except Exception as e:
-            logger.error(f"Mistral OCR API call failed: {e}")
-            raise
-
-        pages = getattr(ocr_response, "pages", None)
-        # Some clients return dict-like response; handle both
-        if pages is None and isinstance(ocr_response, dict):
-            pages = ocr_response.get("pages")
-
-        if not pages:
-            # Return an empty single document to avoid downstream crashes
-            return [
-                Document(
-                    page_content="",
-                    metadata={"source": self.filepath, "page": 1},
-                )
-            ]
-
-        documents: List[Document] = []
-        for page in pages:
-            # Handle both object and dict access
-            index = getattr(page, "index", None) if not isinstance(page, dict) else page.get("index")
-            markdown = getattr(page, "markdown", None) if not isinstance(page, dict) else page.get("markdown")
-            if index is None:
-                # Default to 1-based index progression
-                index = len(documents) + 1
-            content = markdown or ""
-            documents.append(
-                Document(
-                    page_content=content,
-                    metadata={
-                        "source": self.filepath,
-                        "page": index,
-                    },
-                )
-            )
-
-        return documents
+        return _run_mistral_ocr(
+            lambda: {
+                "type": "document_url",
+                "document_url": f"data:application/pdf;base64,{self._encode_pdf_b64()}",
+            },
+            self.filepath,
+        )
 
     def lazy_load(self) -> Iterator[Document]:
         """Yield OCR-extracted pages one at a time.
@@ -365,6 +387,55 @@ class SafePyPDFLoader:
         exists to satisfy the loader interface used by the document routes,
         which call ``lazy_load()``.
         """
+        yield from self.load()
+
+
+class ImageOCRLoader:
+    """OCR a standalone image file via Mistral OCR.
+
+    For images uploaded directly (scanned exhibits, screenshots, photos of
+    documents) — not for images embedded inside PDFs. Each image is normalized
+    to PNG through Pillow so any format is accepted, and multi-page/multi-frame
+    images (e.g. TIFF productions) yield one Document per page.
+    """
+
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self._temp_filepath = None  # For compatibility with cleanup function
+
+    def _iter_png_frames(self) -> Iterator[str]:
+        """Yield base64-encoded PNG data, one entry per image frame/page."""
+        import base64
+        import io
+        from PIL import Image, ImageSequence
+
+        with Image.open(self.filepath) as img:
+            for frame in ImageSequence.Iterator(img):
+                # PNG supports RGB/L directly; convert other modes (P, RGBA,
+                # CMYK, ...) to RGB so the encode never fails.
+                normalized = frame if frame.mode in ("RGB", "L") else frame.convert("RGB")
+                buf = io.BytesIO()
+                normalized.save(buf, format="PNG")
+                yield base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    def load(self) -> List[Document]:
+        documents: List[Document] = []
+        for b64 in self._iter_png_frames():
+            documents.extend(
+                _run_mistral_ocr(
+                    lambda b64=b64: {
+                        "type": "image_url",
+                        "image_url": f"data:image/png;base64,{b64}",
+                    },
+                    self.filepath,
+                )
+            )
+        # Renumber pages sequentially across all frames.
+        for i, doc in enumerate(documents, start=1):
+            doc.metadata["page"] = i
+        return documents
+
+    def lazy_load(self) -> Iterator[Document]:
         yield from self.load()
 
 

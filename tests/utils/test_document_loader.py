@@ -622,3 +622,120 @@ def test_outlook_msg_loader_body_only_when_headers_disabled(tmp_path):
         docs = loader.load()
 
     assert docs[0].page_content == "Just the body."
+
+
+# ---------------------------------------------------------------------------
+# Standalone image OCR (.png/.jpg/.tiff/...)
+# ---------------------------------------------------------------------------
+
+
+def _make_png(path, color=(255, 0, 0)):
+    from PIL import Image
+
+    Image.new("RGB", (8, 8), color).save(path, format="PNG")
+
+
+def _make_multiframe_tiff(path, frames=2):
+    from PIL import Image
+
+    imgs = [Image.new("RGB", (8, 8), (i * 10, 0, 0)) for i in range(frames)]
+    imgs[0].save(path, format="TIFF", save_all=True, append_images=imgs[1:])
+
+
+def test_get_loader_image_png(tmp_path):
+    from app.utils.document_loader import ImageOCRLoader
+
+    p = tmp_path / "scan.png"
+    _make_png(str(p))
+
+    loader, known_type, file_ext = get_loader("scan.png", "image/png", str(p))
+    assert isinstance(loader, ImageOCRLoader)
+    assert known_type is True
+    assert file_ext == "png"
+
+
+def test_get_loader_image_by_content_type(tmp_path):
+    """Routing also works off an image/* Content-Type when the name lacks an ext."""
+    from app.utils.document_loader import ImageOCRLoader
+
+    p = tmp_path / "scan"
+    _make_png(str(p))
+
+    loader, _, _ = get_loader("scan", "image/tiff", str(p))
+    assert isinstance(loader, ImageOCRLoader)
+
+
+def test_get_loader_image_not_hijacked_by_markdown_mime(tmp_path):
+    """A markdown Content-Type must not route an image into the markdown loader."""
+    from app.utils.document_loader import ImageOCRLoader
+
+    p = tmp_path / "scan.png"
+    _make_png(str(p))
+
+    loader, _, _ = get_loader("scan.png", "text/markdown", str(p))
+    assert isinstance(loader, ImageOCRLoader)
+
+
+def test_image_ocr_loader_single_image(tmp_path):
+    from app.utils import document_loader
+    from app.utils.document_loader import ImageOCRLoader
+
+    p = tmp_path / "scan.png"
+    _make_png(str(p))
+
+    fake_module, client = _make_mistral_module(
+        pages=[MagicMock(index=0, markdown="scanned text")]
+    )
+
+    loader = ImageOCRLoader(str(p))
+    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+        document_loader, "MISTRAL_API_KEY", "test-key"
+    ):
+        docs = loader.load()
+
+    assert len(docs) == 1
+    assert docs[0].page_content == "scanned text"
+    assert docs[0].metadata == {"source": str(p), "page": 1}
+    # Sent to Mistral OCR as an image_url data URL
+    _, kwargs = client.ocr.process.call_args
+    assert kwargs["document"]["type"] == "image_url"
+    assert kwargs["document"]["image_url"].startswith("data:image/png;base64,")
+
+
+def test_image_ocr_loader_multipage_tiff_yields_one_doc_per_frame(tmp_path):
+    from app.utils import document_loader
+    from app.utils.document_loader import ImageOCRLoader
+
+    p = tmp_path / "production.tiff"
+    _make_multiframe_tiff(str(p), frames=2)
+
+    fake_module, client = _make_mistral_module(
+        pages=[MagicMock(index=0, markdown="page text")]
+    )
+
+    loader = ImageOCRLoader(str(p))
+    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+        document_loader, "MISTRAL_API_KEY", "test-key"
+    ):
+        docs = loader.load()
+
+    # One OCR call and one Document per TIFF frame, with sequential page numbers.
+    assert client.ocr.process.call_count == 2
+    assert [d.metadata["page"] for d in docs] == [1, 2]
+    assert all(d.page_content == "page text" for d in docs)
+
+
+def test_image_ocr_loader_requires_api_key(tmp_path):
+    from app.utils import document_loader
+    from app.utils.document_loader import ImageOCRLoader
+
+    p = tmp_path / "scan.png"
+    _make_png(str(p))
+
+    fake_module, _ = _make_mistral_module(pages=[])
+    loader = ImageOCRLoader(str(p))
+    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+        document_loader, "MISTRAL_API_KEY", ""
+    ):
+        with pytest.raises(RuntimeError, match="MISTRAL_API_KEY"):
+            loader.load()

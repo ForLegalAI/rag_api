@@ -99,6 +99,7 @@ The following environment variables are required to run the application:
 - `DOCX_TEXT_TRACK_CHANGES`: (Optional) pandoc `--track-changes` mode for the `.docx` `/text` path: `all` (default; keep insertions/deletions, record each edit's author/date, and emit comments), `accept` (final text), or `reject` (original text).
 - `DOCX_TEXT_INCLUDE_HEADERS_FOOTERS`: (Optional) Boolean. When "True" (default), `.docx` headers/footers (matter numbers, "PRIVILEGED & CONFIDENTIAL", "DRAFT", etc.) — which pandoc drops — are extracted via python-docx and prepended to the `/text` output.
 - `EMAIL_INCLUDE_HEADERS`: (Optional) Boolean. When "True" (default), the From/To/Cc/Subject/Date headers are prepended to extracted email text for `.eml` and `.msg` files. Set "False" to extract the body only.
+- Standalone image uploads (`.png`, `.jpg/.jpeg`, `.gif`, `.bmp`, `.tif/.tiff`, `.webp`) — including multi-page TIFF — are run through **Mistral OCR**, yielding one result per page. Requires `MISTRAL_API_KEY` (same key used for PDF OCR). This is separate from PDF handling; images embedded inside PDFs are not extracted.
 - `DEBUG_RAG_API`: (Optional) Set to "True" to show more verbose logging output in the server console, and to enable postgresql database routes
 - `DEBUG_PGVECTOR_QUERIES`: (Optional) Set to "True" to enable detailed PostgreSQL query logging for pgvector operations. Useful for debugging performance issues with vector database queries.
 - `CONSOLE_JSON`: (Optional) Set to "True" to log as json for Cloud Logging aggregations
