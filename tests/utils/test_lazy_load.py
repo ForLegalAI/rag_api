@@ -13,11 +13,40 @@ import shutil
 import tracemalloc
 import zipfile
 from collections.abc import Iterator
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
 
 import pytest
 from langchain_core.documents import Document
 
 from app.utils.document_loader import get_loader, SafePyPDFLoader
+
+
+@contextmanager
+def _mock_mistral_ocr(num_pages=1):
+    """Stub the Mistral OCR client so SafePyPDFLoader returns canned pages.
+
+    SafePyPDFLoader extracts PDF text via a remote Mistral OCR API, which can't
+    run offline. This patches the client to return *num_pages* pages whose
+    markdown is ``PAGE {i} content`` so the loader's lazy_load()/load() contract
+    can be exercised without network access or a real API key.
+    """
+    from app.utils import document_loader
+
+    fake_module = MagicMock()
+    client = MagicMock()
+    response = MagicMock()
+    response.pages = [
+        MagicMock(index=i, markdown=f"PAGE {i} content") for i in range(num_pages)
+    ]
+    client.ocr.process.return_value = response
+    fake_module.Mistral.return_value = client
+    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+        document_loader, "MISTRAL_API_KEY", "test-key"
+    ), patch.object(
+        document_loader.SafePyPDFLoader, "_encode_pdf_b64", return_value="b64"
+    ):
+        yield
 
 # ---------------------------------------------------------------------------
 # Environment checks — these deps aren't guaranteed in every CI runner
@@ -283,7 +312,17 @@ LOADER_CASES = [
         "Hello from lazy_load PY test",
         id="py-source",
     ),
-    pytest.param("test.pdf", "application/pdf", _make_pdf, "PAGE 0", id="pdf"),
+    pytest.param(
+        "test.eml",
+        "message/rfc822",
+        "From: sender@example.com\nSubject: Lazy EML\n\nHello from lazy_load EML test\n",
+        "Hello from lazy_load EML test",
+        id="eml",
+    ),
+    # NOTE: PDF is intentionally excluded here. SafePyPDFLoader uses the remote
+    # Mistral OCR API for text extraction, which can't run through this generic
+    # offline-extraction body. PDF lazy_load()/load() behavior is covered by the
+    # dedicated, Mistral-mocked tests below.
     pytest.param(
         "test.docx",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -388,6 +427,43 @@ def test_lazy_load_matches_load(
 # ---------------------------------------------------------------------------
 
 
+def test_lazy_load_pdf_uses_mistral_ocr(tmp_path):
+    """get_loader() returns a SafePyPDFLoader whose lazy_load() yields OCR pages."""
+    pdf_path = tmp_path / "test.pdf"
+    _make_pdf(str(pdf_path))
+
+    loader, known_type, file_ext = get_loader(
+        "test.pdf", "application/pdf", str(pdf_path)
+    )
+    assert hasattr(loader, "lazy_load")
+    with _mock_mistral_ocr(num_pages=1):
+        docs = list(loader.lazy_load())
+
+    assert len(docs) > 0
+    assert all(isinstance(d, Document) for d in docs)
+    assert "PAGE 0" in " ".join(d.page_content for d in docs)
+    assert known_type is True
+    assert file_ext == "pdf"
+
+
+def test_lazy_load_pdf_matches_load(tmp_path):
+    """For PDFs, lazy_load() consumed as a list matches load() (mocked OCR)."""
+    pdf_path = tmp_path / "test.pdf"
+    _make_pdf(str(pdf_path))
+
+    loader1, _, _ = get_loader("test.pdf", "application/pdf", str(pdf_path))
+    loader2, _, _ = get_loader("test.pdf", "application/pdf", str(pdf_path))
+
+    with _mock_mistral_ocr(num_pages=3):
+        eager_docs = loader1.load()
+    with _mock_mistral_ocr(num_pages=3):
+        lazy_docs = list(loader2.lazy_load())
+
+    assert len(eager_docs) == len(lazy_docs) == 3
+    for eager, lazy in zip(eager_docs, lazy_docs):
+        assert eager.page_content == lazy.page_content
+
+
 def test_safe_pdf_loader_lazy_load_is_iterator(tmp_path):
     """SafePyPDFLoader.lazy_load() should return an Iterator."""
     pdf_path = tmp_path / "gen_test.pdf"
@@ -398,7 +474,8 @@ def test_safe_pdf_loader_lazy_load_is_iterator(tmp_path):
     assert isinstance(result, Iterator)
 
     # Consuming the iterator should yield documents
-    docs = list(result)
+    with _mock_mistral_ocr(num_pages=2):
+        docs = list(result)
     assert len(docs) > 0
 
 
@@ -410,8 +487,10 @@ def test_safe_pdf_loader_load_delegates_to_lazy_load(tmp_path):
     loader1 = SafePyPDFLoader(str(pdf_path), extract_images=False)
     loader2 = SafePyPDFLoader(str(pdf_path), extract_images=False)
 
-    load_docs = loader1.load()
-    lazy_docs = list(loader2.lazy_load())
+    with _mock_mistral_ocr(num_pages=3):
+        load_docs = loader1.load()
+    with _mock_mistral_ocr(num_pages=3):
+        lazy_docs = list(loader2.lazy_load())
 
     assert len(load_docs) == len(lazy_docs)
     for ld, lz in zip(load_docs, lazy_docs):
@@ -486,6 +565,11 @@ def _measure_lazy_load_streaming(loader_factory):
     return texts, peak
 
 
+@pytest.mark.skip(
+    reason="SafePyPDFLoader uses Mistral OCR, which returns all pages in a single "
+    "API response. The page-by-page streaming memory premise of this benchmark "
+    "does not apply, and the loader cannot run offline."
+)
 class TestMemoryBenchmarkPDF:
     """Memory comparison for PyPDFLoader -- the loader most likely to benefit
     from lazy_load() since it yields page-by-page."""
