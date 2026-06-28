@@ -98,9 +98,6 @@ EMBEDDING_BATCH_SIZE = int(get_env_variable("EMBEDDING_BATCH_SIZE", "500"))
 # Higher values allow more parallelism but use more memory.
 EMBEDDING_MAX_QUEUE_SIZE = int(get_env_variable("EMBEDDING_MAX_QUEUE_SIZE", "3"))
 
-env_value = get_env_variable("PDF_EXTRACT_IMAGES", "False").lower()
-PDF_EXTRACT_IMAGES = True if env_value == "true" else False
-
 if POSTGRES_USE_UNIX_SOCKET:
     connection_suffix = f"{urllib.parse.quote_plus(POSTGRES_USER)}:{urllib.parse.quote_plus(POSTGRES_PASSWORD)}@/{urllib.parse.quote_plus(POSTGRES_DB)}?host={urllib.parse.quote_plus(DB_HOST)}"
 else:
@@ -223,6 +220,32 @@ GOOGLE_APPLICATION_CREDENTIALS = get_env_variable("GOOGLE_APPLICATION_CREDENTIAL
 # Mistral OCR settings
 MISTRAL_API_KEY = get_env_variable("MISTRAL_API_KEY", "")
 MISTRAL_OCR_MODEL = get_env_variable("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
+
+# DOCX handling for the /text endpoint: when enabled, .docx files are converted
+# via pandoc so tracked changes and comments are preserved (the embedding path
+# keeps using Docx2txtLoader). DOCX_TEXT_TRACK_CHANGES maps to pandoc's
+# --track-changes flag: "all" keeps insertions/deletions and emits comments,
+# "accept" yields the final text, "reject" yields the original.
+DOCX_TEXT_USE_PANDOC = (
+    get_env_variable("DOCX_TEXT_USE_PANDOC", "True").lower() == "true"
+)
+DOCX_TEXT_TRACK_CHANGES = get_env_variable("DOCX_TEXT_TRACK_CHANGES", "all")
+# Prepend document headers/footers (matter numbers, "PRIVILEGED & CONFIDENTIAL",
+# "DRAFT", etc.) to the pandoc-extracted .docx text, since pandoc drops them.
+DOCX_TEXT_INCLUDE_HEADERS_FOOTERS = (
+    get_env_variable("DOCX_TEXT_INCLUDE_HEADERS_FOOTERS", "True").lower() == "true"
+)
+
+# Email (.eml/.msg) extraction: prepend key headers (From/To/Subject/Date) to the
+# extracted body text so downstream parsing has the message context.
+EMAIL_INCLUDE_HEADERS = (
+    get_env_variable("EMAIL_INCLUDE_HEADERS", "True").lower() == "true"
+)
+
+# Cap how many frames/pages of a single image upload (e.g. animated GIF or a
+# large multi-page TIFF) are sent to OCR, to bound cost/latency. Frames beyond
+# the cap are skipped with a warning.
+IMAGE_OCR_MAX_PAGES = int(get_env_variable("IMAGE_OCR_MAX_PAGES", "100"))
 
 env_value = get_env_variable("RAG_CHECK_EMBEDDING_CTX_LENGTH", "True").lower()
 RAG_CHECK_EMBEDDING_CTX_LENGTH = True if env_value == "true" else False
