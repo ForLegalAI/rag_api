@@ -114,10 +114,11 @@ def _make_mistral_module(pages=None, raise_exc=None):
 
 
 def test_safe_pdf_loader_ocr_maps_pages():
-    """load() maps Mistral OCR pages to Documents with their page index in metadata."""
+    """load() maps Mistral OCR pages to Documents with 1-based sequential page metadata."""
     from app.utils import document_loader
     from app.utils.document_loader import SafePyPDFLoader
 
+    # Mistral indexes pages 0-based; we renumber to 1-based in response order.
     page0 = MagicMock(index=0, markdown="page zero text")
     page1 = MagicMock(index=1, markdown="page one text")
     fake_module, client = _make_mistral_module(pages=[page0, page1])
@@ -129,8 +130,8 @@ def test_safe_pdf_loader_ocr_maps_pages():
         result = loader.load()
 
     assert [d.page_content for d in result] == ["page zero text", "page one text"]
-    assert result[0].metadata == {"source": "dummy.pdf", "page": 0}
-    assert result[1].metadata == {"source": "dummy.pdf", "page": 1}
+    assert result[0].metadata == {"source": "dummy.pdf", "page": 1}
+    assert result[1].metadata == {"source": "dummy.pdf", "page": 2}
     client.ocr.process.assert_called_once()
 
 
@@ -524,6 +525,17 @@ def test_get_loader_eml(tmp_path):
     assert file_ext == "eml"
 
 
+def test_get_loader_eml_not_hijacked_by_markdown_mime(tmp_path):
+    """A markdown Content-Type must not route .eml into the markdown loader."""
+    from app.utils.document_loader import EmailLoader
+
+    file_path = tmp_path / "mail.eml"
+    file_path.write_text(EML_SAMPLE, encoding="utf-8")
+
+    loader, _, _ = get_loader("mail.eml", "text/markdown", str(file_path))
+    assert isinstance(loader, EmailLoader)
+
+
 def test_email_loader_prepends_headers(tmp_path):
     from app.utils.document_loader import EmailLoader
 
@@ -567,23 +579,22 @@ def test_get_loader_msg(tmp_path):
     assert file_ext == "msg"
 
 
-def test_outlook_msg_loader_builds_headers_and_body(tmp_path):
+def test_outlook_msg_loader_builds_headers_from_transport_headers(tmp_path):
+    """Headers come from transport headers (To/Cc preserved, Bcc absent by nature)."""
     from app.utils.document_loader import OutlookMsgLoader
 
     file_path = tmp_path / "mail.msg"
     file_path.write_bytes(b"placeholder")
 
-    # MagicMock(name=...) sets the mock's repr name, not a `.name` attribute,
-    # so assign `.name` explicitly.
-    recipient = MagicMock(email_address="bob@example.com")
-    recipient.name = "Bob"
-
     fake_msg = MagicMock()
     fake_msg.body = "Hi Bob,\nHere are the Q1 results."
-    fake_msg.sender = "Alice <alice@example.com>"
-    fake_msg.subject = "Quarterly numbers"
-    fake_msg.sent_date = "Tue, 1 Apr 2025 10:00:00"
-    fake_msg.recipients = [recipient]
+    fake_msg.message_headers = {
+        "From": "Alice <alice@example.com>",
+        "To": "Bob <bob@example.com>",
+        "Cc": "Carol <carol@example.com>",
+        "Subject": "Quarterly numbers",
+        "Date": "Tue, 1 Apr 2025 10:00:00 -0000",
+    }
 
     fake_oxmsg = MagicMock()
     fake_oxmsg.Message.load.return_value = fake_msg
@@ -596,9 +607,62 @@ def test_outlook_msg_loader_builds_headers_and_body(tmp_path):
     text = docs[0].page_content
     assert "From: Alice <alice@example.com>" in text
     assert "To: Bob <bob@example.com>" in text
+    assert "Cc: Carol <carol@example.com>" in text  # Cc preserved, not collapsed into To
     assert "Subject: Quarterly numbers" in text
     assert "Q1 results" in text
     fake_oxmsg.Message.load.assert_called_once_with(str(file_path))
+
+
+def test_outlook_msg_loader_does_not_leak_bcc_recipients(tmp_path):
+    """msg.recipients (which can include Bcc) must not be surfaced in the output."""
+    from app.utils.document_loader import OutlookMsgLoader
+
+    file_path = tmp_path / "mail.msg"
+    file_path.write_bytes(b"placeholder")
+
+    bcc = MagicMock(email_address="secret-bcc@example.com")
+    bcc.name = "Secret"
+    fake_msg = MagicMock()
+    fake_msg.body = "Body."
+    fake_msg.message_headers = {"To": "Bob <bob@example.com>"}
+    fake_msg.recipients = [bcc]  # present, but must be ignored
+
+    fake_oxmsg = MagicMock()
+    fake_oxmsg.Message.load.return_value = fake_msg
+
+    loader = OutlookMsgLoader(str(file_path), include_headers=True)
+    with patch.dict("sys.modules", {"oxmsg": fake_oxmsg}):
+        docs = loader.load()
+
+    assert "secret-bcc@example.com" not in docs[0].page_content
+    assert "To: Bob <bob@example.com>" in docs[0].page_content
+
+
+def test_outlook_msg_loader_falls_back_to_attributes_without_headers(tmp_path):
+    """When transport headers are absent, From/Subject/Date fall back to attributes."""
+    from app.utils.document_loader import OutlookMsgLoader
+
+    file_path = tmp_path / "mail.msg"
+    file_path.write_bytes(b"placeholder")
+
+    fake_msg = MagicMock()
+    fake_msg.body = "Body text."
+    fake_msg.message_headers = {}  # no transport headers (e.g. a sent draft)
+    fake_msg.sender = "Alice <alice@example.com>"
+    fake_msg.subject = "Quarterly numbers"
+    fake_msg.sent_date = "Tue, 1 Apr 2025 10:00:00"
+
+    fake_oxmsg = MagicMock()
+    fake_oxmsg.Message.load.return_value = fake_msg
+
+    loader = OutlookMsgLoader(str(file_path), include_headers=True)
+    with patch.dict("sys.modules", {"oxmsg": fake_oxmsg}):
+        docs = loader.load()
+
+    text = docs[0].page_content
+    assert "From: Alice <alice@example.com>" in text
+    assert "Subject: Quarterly numbers" in text
+    assert "Body text." in text
 
 
 def test_outlook_msg_loader_body_only_when_headers_disabled(tmp_path):
@@ -609,7 +673,6 @@ def test_outlook_msg_loader_body_only_when_headers_disabled(tmp_path):
 
     fake_msg = MagicMock()
     fake_msg.body = "Just the body."
-    fake_msg.recipients = []
 
     fake_oxmsg = MagicMock()
     fake_oxmsg.Message.load.return_value = fake_msg
@@ -720,6 +783,28 @@ def test_image_ocr_loader_multipage_tiff_yields_one_doc_per_frame(tmp_path):
     assert client.ocr.process.call_count == 2
     assert [d.metadata["page"] for d in docs] == [1, 2]
     assert all(d.page_content == "page text" for d in docs)
+
+
+def test_image_ocr_loader_caps_frames(tmp_path):
+    """Frames beyond IMAGE_OCR_MAX_PAGES are skipped (no unbounded OCR fan-out)."""
+    from app.utils import document_loader
+    from app.utils.document_loader import ImageOCRLoader
+
+    p = tmp_path / "huge.tiff"
+    _make_multiframe_tiff(str(p), frames=5)
+
+    fake_module, client = _make_mistral_module(
+        pages=[MagicMock(index=0, markdown="page text")]
+    )
+
+    loader = ImageOCRLoader(str(p))
+    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+        document_loader, "MISTRAL_API_KEY", "test-key"
+    ), patch.object(document_loader, "IMAGE_OCR_MAX_PAGES", 2):
+        docs = loader.load()
+
+    assert client.ocr.process.call_count == 2
+    assert len(docs) == 2
 
 
 def test_image_ocr_loader_requires_api_key(tmp_path):

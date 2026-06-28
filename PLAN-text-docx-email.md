@@ -198,6 +198,39 @@ elif file_ext == "msg" or file_content_type == "application/vnd.ms-outlook":
     and the vestigial `extract_images` param on `SafePyPDFLoader` (it was hardcoded off
     and unused). The PDF OCR behavior is unchanged.
 
+## Code-review fixes (applied)
+Correctness:
+- **`.eml` routing**: added `eml` to `_BINARY_FILE_EXTENSIONS` so a stray
+  `text/markdown` Content-Type can't hijack it away from `EmailLoader`.
+- **`.msg` Bcc leak / Cc loss**: `OutlookMsgLoader` now builds headers from the
+  message's transport headers (real To/Cc split, Bcc absent by nature) instead of
+  `msg.recipients` (which oxmsg exposes without a recipient type, so it both
+  collapsed To/Cc and could leak Bcc from Sent-Items files). From/Subject/Date
+  fall back to the structured attributes.
+- **Image OCR frame cap**: `ImageOCRLoader` stops after `IMAGE_OCR_MAX_PAGES`
+  (default 100) frames, preventing unbounded OCR fan-out from an animated GIF or
+  huge multi-page TIFF.
+- **PDF/image page numbering**: OCR pages are now numbered 1-based sequentially
+  (was passing Mistral's 0-based index straight through, which `process_documents`
+  treated as "no page", dropping the first page's marker).
+
+Efficiency / robustness:
+- Split the OCR helper into `_mistral_ocr_client()` + `_ocr_document()`: the
+  client is built **once** per file (was once per image frame), and the API-key
+  check runs **before** any file decode/encode (fail-fast, fixes the image path's
+  contract violation).
+- `ImageOCRLoader` passes single-frame **PNG/JPEG through unmodified** (no Pillow
+  decode/re-encode); only multi-frame/odd-mode images are normalized to PNG.
+- Single-pass page numbering (removed the build-then-renumber second loop); zero-
+  frame images still return a placeholder Document (≥1-doc invariant preserved).
+- `EmailLoader` header parse uses `headersonly=True` (no second body parse).
+- Pinned `python-oxmsg>=0.0.2,<0.1` (was unbounded on a 0.0.x package).
+
+Deferred (larger refactors, noted not done): a single extension→content-type→loader
+registry (the routing lists are still maintained per-branch), generalizing the
+`raw_text` per-format special-casing, and a shared base loader for the
+`lazy_load`/`_temp_filepath` boilerplate.
+
 ## Implementation status — DONE
 - `app/config.py`: `DOCX_TEXT_USE_PANDOC`, `DOCX_TEXT_TRACK_CHANGES`, `EMAIL_INCLUDE_HEADERS`.
 - `app/utils/document_loader.py`: new `PandocDocxLoader`, `EmailLoader`,

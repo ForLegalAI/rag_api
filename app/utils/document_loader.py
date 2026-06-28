@@ -19,6 +19,7 @@ from app.config import (
     DOCX_TEXT_TRACK_CHANGES,
     DOCX_TEXT_INCLUDE_HEADERS_FOOTERS,
     EMAIL_INCLUDE_HEADERS,
+    IMAGE_OCR_MAX_PAGES,
 )
 from langchain_community.document_loaders import (
     TextLoader,
@@ -46,7 +47,9 @@ _IMAGE_EXTENSIONS = frozenset(
 # from hijacking these files into a text loader. RTF is markup (not plain text),
 # so it belongs here too, as do raster image formats.
 _BINARY_FILE_EXTENSIONS = (
-    frozenset({"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "epub", "msg", "rtf"})
+    frozenset(
+        {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "epub", "msg", "eml", "rtf"}
+    )
     | _IMAGE_EXTENSIONS
 )
 
@@ -284,14 +287,11 @@ def process_documents(documents: List[Document]) -> str:
     return processed_text.strip()
 
 
-def _run_mistral_ocr(build_document, source: str) -> List[Document]:
-    """Run Mistral OCR for a document/image payload and map pages to Documents.
+def _mistral_ocr_client():
+    """Import mistralai, validate the API key, and return a configured client.
 
-    Shared by the PDF and image loaders. ``build_document`` is a no-arg callable
-    returning the OCR ``document`` payload (e.g. a base64 data URL); it is
-    invoked only after the API-key check passes, so encoding work is skipped
-    when OCR can't run. Returns one Document per page (1-based ``page``
-    metadata), or a single empty placeholder when the response has no pages.
+    Raised before any file encoding so OCR work is skipped when it can't run,
+    and so a multi-page image builds the client only once.
     """
     # Lazy import to avoid hard dependency at import time
     try:
@@ -306,12 +306,20 @@ def _run_mistral_ocr(build_document, source: str) -> List[Document]:
             "MISTRAL_API_KEY is not set. Please configure it in environment variables."
         )
 
-    client = Mistral(api_key=MISTRAL_API_KEY)
+    return Mistral(api_key=MISTRAL_API_KEY)
 
+
+def _ocr_document(client, document_payload: dict, source: str, start_page: int = 1) -> List[Document]:
+    """Run one Mistral OCR request and map its pages to Documents.
+
+    Pages are numbered sequentially (1-based) from ``start_page`` in response
+    order, so callers don't depend on the provider's own (0-based) page index.
+    Returns a single empty placeholder when the response has no pages.
+    """
     try:
         ocr_response = client.ocr.process(
             model=MISTRAL_OCR_MODEL,
-            document=build_document(),
+            document=document_payload,
             include_image_base64=False,
         )
     except Exception as e:
@@ -325,20 +333,17 @@ def _run_mistral_ocr(build_document, source: str) -> List[Document]:
 
     if not pages:
         # Return an empty single document to avoid downstream crashes
-        return [Document(page_content="", metadata={"source": source, "page": 1})]
+        return [Document(page_content="", metadata={"source": source, "page": start_page})]
 
     documents: List[Document] = []
-    for page in pages:
-        # Handle both object and dict access
-        index = getattr(page, "index", None) if not isinstance(page, dict) else page.get("index")
-        markdown = getattr(page, "markdown", None) if not isinstance(page, dict) else page.get("markdown")
-        if index is None:
-            # Default to 1-based index progression
-            index = len(documents) + 1
+    for offset, page in enumerate(pages):
+        markdown = (
+            page.get("markdown") if isinstance(page, dict) else getattr(page, "markdown", None)
+        )
         documents.append(
             Document(
                 page_content=markdown or "",
-                metadata={"source": source, "page": index},
+                metadata={"source": source, "page": start_page + offset},
             )
         )
 
@@ -368,13 +373,12 @@ class SafePyPDFLoader:
             return base64.b64encode(f.read()).decode("utf-8")
 
     def load(self) -> List[Document]:
-        return _run_mistral_ocr(
-            lambda: {
-                "type": "document_url",
-                "document_url": f"data:application/pdf;base64,{self._encode_pdf_b64()}",
-            },
-            self.filepath,
-        )
+        client = _mistral_ocr_client()  # validates the key before encoding the file
+        payload = {
+            "type": "document_url",
+            "document_url": f"data:application/pdf;base64,{self._encode_pdf_b64()}",
+        }
+        return _ocr_document(client, payload, self.filepath)
 
     def lazy_load(self) -> Iterator[Document]:
         """Yield OCR-extracted pages one at a time.
@@ -391,45 +395,64 @@ class ImageOCRLoader:
     """OCR a standalone image file via Mistral OCR.
 
     For images uploaded directly (scanned exhibits, screenshots, photos of
-    documents) — not for images embedded inside PDFs. Each image is normalized
-    to PNG through Pillow so any format is accepted, and multi-page/multi-frame
-    images (e.g. TIFF productions) yield one Document per page.
+    documents) — not for images embedded inside PDFs. Single-frame PNG/JPEG are
+    sent as-is; other formats and modes are normalized to PNG via Pillow, and
+    multi-frame images (e.g. TIFF productions, animated GIF) yield one Document
+    per frame, capped at ``IMAGE_OCR_MAX_PAGES``.
     """
 
     def __init__(self, filepath: str):
         self.filepath = filepath
         self._temp_filepath = None  # For compatibility with cleanup function
 
-    def _iter_png_frames(self) -> Iterator[str]:
-        """Yield base64-encoded PNG data, one entry per image frame/page."""
+    def _iter_image_payloads(self) -> Iterator[tuple]:
+        """Yield ``(mime, base64)`` for each frame to OCR.
+
+        A single-frame PNG/JPEG is passed through unmodified (no decode/re-encode);
+        everything else (multi-frame TIFF/GIF, palette/CMYK/RGBA modes) is
+        normalized to PNG via Pillow.
+        """
         import base64
         import io
         from PIL import Image, ImageSequence
 
         with Image.open(self.filepath) as img:
+            fmt = (img.format or "").upper()
+            if getattr(img, "n_frames", 1) == 1 and fmt in ("PNG", "JPEG"):
+                with open(self.filepath, "rb") as f:
+                    raw = f.read()
+                mime = "image/png" if fmt == "PNG" else "image/jpeg"
+                yield mime, base64.b64encode(raw).decode("utf-8")
+                return
+
             for frame in ImageSequence.Iterator(img):
                 # PNG supports RGB/L directly; convert other modes (P, RGBA,
                 # CMYK, ...) to RGB so the encode never fails.
                 normalized = frame if frame.mode in ("RGB", "L") else frame.convert("RGB")
                 buf = io.BytesIO()
                 normalized.save(buf, format="PNG")
-                yield base64.b64encode(buf.getvalue()).decode("utf-8")
+                yield "image/png", base64.b64encode(buf.getvalue()).decode("utf-8")
 
     def load(self) -> List[Document]:
+        client = _mistral_ocr_client()  # validates the key before decoding the image
+
         documents: List[Document] = []
-        for b64 in self._iter_png_frames():
-            documents.extend(
-                _run_mistral_ocr(
-                    lambda b64=b64: {
-                        "type": "image_url",
-                        "image_url": f"data:image/png;base64,{b64}",
-                    },
+        for mime, b64 in self._iter_image_payloads():
+            if len(documents) >= IMAGE_OCR_MAX_PAGES:
+                logger.warning(
+                    "Image %s exceeds IMAGE_OCR_MAX_PAGES=%d; remaining frames skipped",
                     self.filepath,
+                    IMAGE_OCR_MAX_PAGES,
                 )
+                break
+            payload = {"type": "image_url", "image_url": f"data:{mime};base64,{b64}"}
+            documents.extend(
+                _ocr_document(client, payload, self.filepath, start_page=len(documents) + 1)
             )
-        # Renumber pages sequentially across all frames.
-        for i, doc in enumerate(documents, start=1):
-            doc.metadata["page"] = i
+
+        if not documents:
+            # Preserve the always-at-least-one-Document invariant.
+            return [Document(page_content="", metadata={"source": self.filepath, "page": 1})]
         return documents
 
     def lazy_load(self) -> Iterator[Document]:
@@ -567,8 +590,10 @@ class EmailLoader:
         from email import policy
         from email.parser import BytesParser
 
+        # headersonly avoids re-parsing the body, which UnstructuredEmailLoader
+        # already parsed for us.
         with open(self.filepath, "rb") as f:
-            msg = BytesParser(policy=policy.default).parse(f)
+            msg = BytesParser(policy=policy.default).parse(f, headersonly=True)
         return _format_email_headers(
             {
                 "From": msg.get("From"),
@@ -597,25 +622,20 @@ class OutlookMsgLoader:
     """Load a ``.msg`` (Outlook) message as a single Document via python-oxmsg.
 
     Extracts the plain-text body and, when ``include_headers`` is enabled,
-    prepends From/To/Subject/Date built from the message metadata.
+    prepends From/To/Cc/Subject/Date.
+
+    Header values come from the message's transport headers, which carry the
+    real To/Cc split and — importantly — do **not** include Bcc. We deliberately
+    avoid ``msg.recipients`` for this, because oxmsg exposes no recipient type,
+    so using it would both collapse To/Cc and leak Bcc recipients (present in
+    Sent-Items .msg files) into the extracted text. From/Subject/Date fall back
+    to the structured attributes when a transport header is absent.
     """
 
     def __init__(self, filepath: str, include_headers: bool = EMAIL_INCLUDE_HEADERS):
         self.filepath = filepath
         self.include_headers = include_headers
         self._temp_filepath = None  # For compatibility with cleanup function
-
-    @staticmethod
-    def _format_recipients(recipients) -> str:
-        parts = []
-        for r in recipients or []:
-            name = getattr(r, "name", None)
-            email = getattr(r, "email_address", None)
-            if name and email:
-                parts.append(f"{name} <{email}>")
-            elif email or name:
-                parts.append(email or name)
-        return ", ".join(parts)
 
     def load(self) -> List[Document]:
         try:
@@ -631,13 +651,20 @@ class OutlookMsgLoader:
 
         content = body
         if self.include_headers:
+            raw_headers = getattr(msg, "message_headers", None) or {}
+            headers = {str(k).lower(): v for k, v in raw_headers.items()}
+
+            def hdr(name, fallback=None):
+                return headers.get(name.lower()) or fallback
+
             sent_date = getattr(msg, "sent_date", None)
             header_block = _format_email_headers(
                 {
-                    "From": getattr(msg, "sender", None),
-                    "To": self._format_recipients(getattr(msg, "recipients", None)),
-                    "Subject": getattr(msg, "subject", None),
-                    "Date": str(sent_date) if sent_date else None,
+                    "From": hdr("From", getattr(msg, "sender", None)),
+                    "To": hdr("To"),
+                    "Cc": hdr("Cc"),
+                    "Subject": hdr("Subject", getattr(msg, "subject", None)),
+                    "Date": hdr("Date", str(sent_date) if sent_date else None),
                 }
             )
             content = _combine_headers_and_body(header_block, body)

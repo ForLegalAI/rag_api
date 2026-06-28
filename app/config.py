@@ -242,6 +242,11 @@ EMAIL_INCLUDE_HEADERS = (
     get_env_variable("EMAIL_INCLUDE_HEADERS", "True").lower() == "true"
 )
 
+# Cap how many frames/pages of a single image upload (e.g. animated GIF or a
+# large multi-page TIFF) are sent to OCR, to bound cost/latency. Frames beyond
+# the cap are skipped with a warning.
+IMAGE_OCR_MAX_PAGES = int(get_env_variable("IMAGE_OCR_MAX_PAGES", "100"))
+
 env_value = get_env_variable("RAG_CHECK_EMBEDDING_CTX_LENGTH", "True").lower()
 RAG_CHECK_EMBEDDING_CTX_LENGTH = True if env_value == "true" else False
 

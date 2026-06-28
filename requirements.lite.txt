@@ -18,7 +18,7 @@ openpyxl==3.1.5
 docx2txt==0.9
 python-docx==1.1.2  # .docx header/footer extraction (pandoc drops them)
 pypandoc==1.15
-python-oxmsg>=0.0.2  # .msg (Outlook) extraction; also a transitive of unstructured
+python-oxmsg>=0.0.2,<0.1  # .msg (Outlook) extraction; also a transitive of unstructured
 Pillow>=10.0.0  # normalize standalone images (incl. multi-page TIFF) for OCR
 PyJWT==2.13.0
 asyncpg==0.29.0
