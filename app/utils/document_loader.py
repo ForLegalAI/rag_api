@@ -9,7 +9,17 @@ import chardet
 
 from langchain_core.documents import Document
 
-from app.config import known_source_ext, PDF_EXTRACT_IMAGES, CHUNK_OVERLAP, logger, MISTRAL_API_KEY, MISTRAL_OCR_MODEL
+from app.config import (
+    known_source_ext,
+    PDF_EXTRACT_IMAGES,
+    CHUNK_OVERLAP,
+    logger,
+    MISTRAL_API_KEY,
+    MISTRAL_OCR_MODEL,
+    DOCX_TEXT_USE_PANDOC,
+    DOCX_TEXT_TRACK_CHANGES,
+    EMAIL_INCLUDE_HEADERS,
+)
 from langchain_community.document_loaders import (
     TextLoader,
     CSVLoader,
@@ -20,6 +30,7 @@ from langchain_community.document_loaders import (
     UnstructuredRSTLoader,
     UnstructuredExcelLoader,
     UnstructuredPowerPointLoader,
+    UnstructuredEmailLoader,
 )
 
 
@@ -27,7 +38,7 @@ from langchain_community.document_loaders import (
 # Used to prevent a conflicting multipart Content-Type (e.g. ``text/markdown``)
 # from hijacking these files into a text loader.
 _BINARY_FILE_EXTENSIONS = frozenset(
-    {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "epub"}
+    {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "epub", "msg"}
 )
 
 
@@ -81,7 +92,7 @@ def get_loader(
     filepath: str,
     raw_text: bool = False,
 ):
-    """Get the appropriate document loader based on file type and\or content type.
+    """Get the appropriate document loader based on file type and/or content type.
 
     When ``raw_text`` is True, text-formatted files (e.g. Markdown) are loaded
     verbatim with :class:`TextLoader` so their original formatting is
@@ -161,7 +172,17 @@ def get_loader(
         "application/msword",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ]:
-        loader = Docx2txtLoader(filepath)
+        # On the /text endpoint (raw_text=True), use pandoc for .docx so tracked
+        # changes and comments are preserved. pandoc only reads OOXML .docx, not
+        # legacy binary .doc, so .doc keeps using Docx2txtLoader.
+        if raw_text and DOCX_TEXT_USE_PANDOC and file_ext == "docx":
+            loader = PandocDocxLoader(filepath)
+        else:
+            loader = Docx2txtLoader(filepath)
+    elif file_ext == "eml" or file_content_type == "message/rfc822":
+        loader = EmailLoader(filepath)
+    elif file_ext == "msg" or file_content_type == "application/vnd.ms-outlook":
+        loader = OutlookMsgLoader(filepath)
     elif file_ext in ["xls", "xlsx"] or file_content_type in [
         "application/vnd.ms-excel",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -339,4 +360,161 @@ class SafePyPDFLoader:
         exists to satisfy the loader interface used by the document routes,
         which call ``lazy_load()``.
         """
+        yield from self.load()
+
+
+def _format_email_headers(headers: dict) -> str:
+    """Build a header block from available email header values.
+
+    Renders ``Label: value`` lines for the standard headers, skipping any that
+    are missing/empty. Returns an empty string when no headers are present.
+    """
+    lines = []
+    for label in ("From", "To", "Cc", "Subject", "Date"):
+        value = headers.get(label)
+        if value:
+            lines.append(f"{label}: {value}")
+    return "\n".join(lines)
+
+
+def _combine_headers_and_body(header_block: str, body: str) -> str:
+    """Join a header block and body with a blank line, tolerating empty sides."""
+    if header_block and body:
+        return f"{header_block}\n\n{body}"
+    return header_block or body
+
+
+class PandocDocxLoader:
+    """Load a ``.docx`` via pandoc so tracked changes and comments are preserved.
+
+    Used by the ``/text`` endpoint (``raw_text=True``); the embedding path keeps
+    using ``Docx2txtLoader``. Produces a single :class:`Document` whose
+    ``page_content`` is pandoc Markdown. ``track_changes`` maps to pandoc's
+    ``--track-changes`` flag (``all`` keeps insertions/deletions and emits
+    comments). pandoc only reads OOXML ``.docx``, not legacy binary ``.doc``.
+    """
+
+    def __init__(self, filepath: str, track_changes: str = DOCX_TEXT_TRACK_CHANGES):
+        self.filepath = filepath
+        self.track_changes = track_changes
+        self._temp_filepath = None  # For compatibility with cleanup function
+
+    def load(self) -> List[Document]:
+        try:
+            import pypandoc
+        except Exception as e:
+            raise RuntimeError(
+                "pypandoc is required to extract .docx text via pandoc. "
+                "Please install 'pypandoc' and ensure the pandoc binary is available."
+            ) from e
+
+        # Lets pypandoc's "No pandoc was found" OSError propagate so the /text
+        # route can surface ERROR_MESSAGES.PANDOC_NOT_INSTALLED.
+        text = pypandoc.convert_file(
+            self.filepath,
+            to="markdown",
+            format="docx",
+            extra_args=[f"--track-changes={self.track_changes}", "--wrap=none"],
+        )
+        return [Document(page_content=text, metadata={"source": self.filepath})]
+
+    def lazy_load(self) -> Iterator[Document]:
+        yield from self.load()
+
+
+class EmailLoader:
+    """Load a ``.eml`` (RFC-822) message as a single Document.
+
+    The body is extracted with :class:`UnstructuredEmailLoader` (handles plain
+    and HTML parts); when ``include_headers`` is enabled, the standard headers
+    (From/To/Cc/Subject/Date) parsed from the message are prepended.
+    """
+
+    def __init__(self, filepath: str, include_headers: bool = EMAIL_INCLUDE_HEADERS):
+        self.filepath = filepath
+        self.include_headers = include_headers
+        self._temp_filepath = None  # For compatibility with cleanup function
+
+    def _read_headers(self) -> str:
+        from email import policy
+        from email.parser import BytesParser
+
+        with open(self.filepath, "rb") as f:
+            msg = BytesParser(policy=policy.default).parse(f)
+        return _format_email_headers(
+            {
+                "From": msg.get("From"),
+                "To": msg.get("To"),
+                "Cc": msg.get("Cc"),
+                "Subject": msg.get("Subject"),
+                "Date": msg.get("Date"),
+            }
+        )
+
+    def load(self) -> List[Document]:
+        body_docs = UnstructuredEmailLoader(self.filepath).load()
+        body = "\n".join(d.page_content for d in body_docs).strip()
+
+        content = body
+        if self.include_headers:
+            content = _combine_headers_and_body(self._read_headers(), body)
+
+        return [Document(page_content=content, metadata={"source": self.filepath})]
+
+    def lazy_load(self) -> Iterator[Document]:
+        yield from self.load()
+
+
+class OutlookMsgLoader:
+    """Load a ``.msg`` (Outlook) message as a single Document via python-oxmsg.
+
+    Extracts the plain-text body and, when ``include_headers`` is enabled,
+    prepends From/To/Subject/Date built from the message metadata.
+    """
+
+    def __init__(self, filepath: str, include_headers: bool = EMAIL_INCLUDE_HEADERS):
+        self.filepath = filepath
+        self.include_headers = include_headers
+        self._temp_filepath = None  # For compatibility with cleanup function
+
+    @staticmethod
+    def _format_recipients(recipients) -> str:
+        parts = []
+        for r in recipients or []:
+            name = getattr(r, "name", None)
+            email = getattr(r, "email_address", None)
+            if name and email:
+                parts.append(f"{name} <{email}>")
+            elif email or name:
+                parts.append(email or name)
+        return ", ".join(parts)
+
+    def load(self) -> List[Document]:
+        try:
+            from oxmsg import Message
+        except Exception as e:
+            raise RuntimeError(
+                "python-oxmsg is required to extract .msg files. "
+                "Please install 'python-oxmsg'."
+            ) from e
+
+        msg = Message.load(self.filepath)
+        body = (msg.body or "").strip()
+
+        content = body
+        if self.include_headers:
+            sent_date = getattr(msg, "sent_date", None)
+            header_block = _format_email_headers(
+                {
+                    "From": getattr(msg, "sender", None),
+                    "To": self._format_recipients(getattr(msg, "recipients", None)),
+                    "Subject": getattr(msg, "subject", None),
+                    "Date": str(sent_date) if sent_date else None,
+                }
+            )
+            content = _combine_headers_and_body(header_block, body)
+
+        return [Document(page_content=content, metadata={"source": self.filepath})]
+
+    def lazy_load(self) -> Iterator[Document]:
         yield from self.load()

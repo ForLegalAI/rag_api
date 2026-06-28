@@ -224,6 +224,22 @@ GOOGLE_APPLICATION_CREDENTIALS = get_env_variable("GOOGLE_APPLICATION_CREDENTIAL
 MISTRAL_API_KEY = get_env_variable("MISTRAL_API_KEY", "")
 MISTRAL_OCR_MODEL = get_env_variable("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
 
+# DOCX handling for the /text endpoint: when enabled, .docx files are converted
+# via pandoc so tracked changes and comments are preserved (the embedding path
+# keeps using Docx2txtLoader). DOCX_TEXT_TRACK_CHANGES maps to pandoc's
+# --track-changes flag: "all" keeps insertions/deletions and emits comments,
+# "accept" yields the final text, "reject" yields the original.
+DOCX_TEXT_USE_PANDOC = (
+    get_env_variable("DOCX_TEXT_USE_PANDOC", "True").lower() == "true"
+)
+DOCX_TEXT_TRACK_CHANGES = get_env_variable("DOCX_TEXT_TRACK_CHANGES", "all")
+
+# Email (.eml/.msg) extraction: prepend key headers (From/To/Subject/Date) to the
+# extracted body text so downstream parsing has the message context.
+EMAIL_INCLUDE_HEADERS = (
+    get_env_variable("EMAIL_INCLUDE_HEADERS", "True").lower() == "true"
+)
+
 env_value = get_env_variable("RAG_CHECK_EMBEDDING_CTX_LENGTH", "True").lower()
 RAG_CHECK_EMBEDDING_CTX_LENGTH = True if env_value == "true" else False
 

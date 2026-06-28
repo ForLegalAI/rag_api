@@ -278,7 +278,9 @@ def test_get_loader_raw_text_leaves_pdf_alone(tmp_path):
     "filename, expected_loader_name",
     [
         ("doc.pdf", "SafePyPDFLoader"),
-        ("report.docx", "Docx2txtLoader"),
+        # .docx on the /text path (raw_text=True) routes to pandoc for tracked
+        # changes/comments; the markdown Content-Type must not override that.
+        ("report.docx", "PandocDocxLoader"),
         ("book.epub", "UnstructuredEPubLoader"),
         ("data.xlsx", "UnstructuredExcelLoader"),
         ("slides.pptx", "UnstructuredPowerPointLoader"),
@@ -301,3 +303,219 @@ def test_get_loader_raw_text_respects_binary_extensions_over_markdown_mime(
     )
 
     assert type(loader).__name__ == expected_loader_name
+
+
+# ---------------------------------------------------------------------------
+# DOCX via pandoc (/text endpoint)
+# ---------------------------------------------------------------------------
+
+
+def test_get_loader_docx_embed_uses_docx2txt(tmp_path):
+    """Embedding path (raw_text=False) keeps Docx2txtLoader for .docx."""
+    from langchain_community.document_loaders import Docx2txtLoader
+
+    file_path = tmp_path / "report.docx"
+    file_path.write_bytes(b"placeholder")
+
+    loader, known_type, file_ext = get_loader(
+        "report.docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        str(file_path),
+    )
+    assert isinstance(loader, Docx2txtLoader)
+    assert known_type is True
+    assert file_ext == "docx"
+
+
+def test_get_loader_docx_raw_text_uses_pandoc(tmp_path):
+    """/text path (raw_text=True) routes .docx to PandocDocxLoader."""
+    from app.utils.document_loader import PandocDocxLoader
+
+    file_path = tmp_path / "report.docx"
+    file_path.write_bytes(b"placeholder")
+
+    loader, _, file_ext = get_loader(
+        "report.docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        str(file_path),
+        raw_text=True,
+    )
+    assert isinstance(loader, PandocDocxLoader)
+    assert file_ext == "docx"
+
+
+def test_get_loader_legacy_doc_raw_text_stays_docx2txt(tmp_path):
+    """pandoc can't read legacy binary .doc, so it stays on Docx2txtLoader even on /text."""
+    from langchain_community.document_loaders import Docx2txtLoader
+
+    file_path = tmp_path / "legacy.doc"
+    file_path.write_bytes(b"placeholder")
+
+    loader, _, file_ext = get_loader(
+        "legacy.doc", "application/msword", str(file_path), raw_text=True
+    )
+    assert isinstance(loader, Docx2txtLoader)
+    assert file_ext == "doc"
+
+
+def test_pandoc_docx_loader_passes_track_changes_and_builds_document(tmp_path):
+    """PandocDocxLoader converts via pypandoc with --track-changes and wraps output."""
+    from app.utils.document_loader import PandocDocxLoader
+
+    file_path = tmp_path / "doc.docx"
+    file_path.write_bytes(b"placeholder")
+
+    fake_pypandoc = MagicMock()
+    fake_pypandoc.convert_file.return_value = "converted [text]{.insertion} markdown"
+
+    loader = PandocDocxLoader(str(file_path), track_changes="all")
+    with patch.dict("sys.modules", {"pypandoc": fake_pypandoc}):
+        docs = loader.load()
+
+    assert len(docs) == 1
+    assert docs[0].page_content == "converted [text]{.insertion} markdown"
+    assert docs[0].metadata["source"] == str(file_path)
+
+    _, kwargs = fake_pypandoc.convert_file.call_args
+    assert kwargs["to"] == "markdown"
+    assert kwargs["format"] == "docx"
+    assert "--track-changes=all" in kwargs["extra_args"]
+
+
+def test_pandoc_docx_loader_lazy_load_yields_from_load(tmp_path):
+    from app.utils.document_loader import PandocDocxLoader
+
+    loader = PandocDocxLoader(str(tmp_path / "doc.docx"))
+    docs = [Document(page_content="x")]
+    with patch.object(PandocDocxLoader, "load", return_value=docs):
+        result = list(loader.lazy_load())
+    assert result == docs
+
+
+# ---------------------------------------------------------------------------
+# Email (.eml / .msg)
+# ---------------------------------------------------------------------------
+
+EML_SAMPLE = (
+    "From: Alice <alice@example.com>\n"
+    "To: Bob <bob@example.com>\n"
+    "Subject: Quarterly numbers\n"
+    "Date: Tue, 1 Apr 2025 10:00:00 -0000\n"
+    'Content-Type: text/plain; charset="utf-8"\n'
+    "\n"
+    "Hi Bob,\n"
+    "Here are the Q1 results. Revenue up 12%.\n"
+    "Thanks,\n"
+    "Alice\n"
+)
+
+
+def test_get_loader_eml(tmp_path):
+    from app.utils.document_loader import EmailLoader
+
+    file_path = tmp_path / "mail.eml"
+    file_path.write_text(EML_SAMPLE, encoding="utf-8")
+
+    loader, known_type, file_ext = get_loader(
+        "mail.eml", "message/rfc822", str(file_path)
+    )
+    assert isinstance(loader, EmailLoader)
+    assert known_type is True
+    assert file_ext == "eml"
+
+
+def test_email_loader_prepends_headers(tmp_path):
+    from app.utils.document_loader import EmailLoader
+
+    file_path = tmp_path / "mail.eml"
+    file_path.write_text(EML_SAMPLE, encoding="utf-8")
+
+    docs = EmailLoader(str(file_path), include_headers=True).load()
+    assert len(docs) == 1
+    text = docs[0].page_content
+    assert "From: Alice <alice@example.com>" in text
+    assert "To: Bob <bob@example.com>" in text
+    assert "Subject: Quarterly numbers" in text
+    assert "Q1 results" in text
+    # Header block precedes the body
+    assert text.index("Subject:") < text.index("Q1 results")
+
+
+def test_email_loader_body_only_when_headers_disabled(tmp_path):
+    from app.utils.document_loader import EmailLoader
+
+    file_path = tmp_path / "mail.eml"
+    file_path.write_text(EML_SAMPLE, encoding="utf-8")
+
+    docs = EmailLoader(str(file_path), include_headers=False).load()
+    text = docs[0].page_content
+    assert "From:" not in text
+    assert "Subject:" not in text
+    assert "Q1 results" in text
+
+
+def test_get_loader_msg(tmp_path):
+    from app.utils.document_loader import OutlookMsgLoader
+
+    file_path = tmp_path / "mail.msg"
+    file_path.write_bytes(b"placeholder")
+
+    loader, known_type, file_ext = get_loader(
+        "mail.msg", "application/vnd.ms-outlook", str(file_path)
+    )
+    assert isinstance(loader, OutlookMsgLoader)
+    assert file_ext == "msg"
+
+
+def test_outlook_msg_loader_builds_headers_and_body(tmp_path):
+    from app.utils.document_loader import OutlookMsgLoader
+
+    file_path = tmp_path / "mail.msg"
+    file_path.write_bytes(b"placeholder")
+
+    # MagicMock(name=...) sets the mock's repr name, not a `.name` attribute,
+    # so assign `.name` explicitly.
+    recipient = MagicMock(email_address="bob@example.com")
+    recipient.name = "Bob"
+
+    fake_msg = MagicMock()
+    fake_msg.body = "Hi Bob,\nHere are the Q1 results."
+    fake_msg.sender = "Alice <alice@example.com>"
+    fake_msg.subject = "Quarterly numbers"
+    fake_msg.sent_date = "Tue, 1 Apr 2025 10:00:00"
+    fake_msg.recipients = [recipient]
+
+    fake_oxmsg = MagicMock()
+    fake_oxmsg.Message.load.return_value = fake_msg
+
+    loader = OutlookMsgLoader(str(file_path), include_headers=True)
+    with patch.dict("sys.modules", {"oxmsg": fake_oxmsg}):
+        docs = loader.load()
+
+    assert len(docs) == 1
+    text = docs[0].page_content
+    assert "From: Alice <alice@example.com>" in text
+    assert "To: Bob <bob@example.com>" in text
+    assert "Subject: Quarterly numbers" in text
+    assert "Q1 results" in text
+    fake_oxmsg.Message.load.assert_called_once_with(str(file_path))
+
+
+def test_outlook_msg_loader_body_only_when_headers_disabled(tmp_path):
+    from app.utils.document_loader import OutlookMsgLoader
+
+    file_path = tmp_path / "mail.msg"
+    file_path.write_bytes(b"placeholder")
+
+    fake_msg = MagicMock()
+    fake_msg.body = "Just the body."
+    fake_msg.recipients = []
+
+    fake_oxmsg = MagicMock()
+    fake_oxmsg.Message.load.return_value = fake_msg
+
+    loader = OutlookMsgLoader(str(file_path), include_headers=False)
+    with patch.dict("sys.modules", {"oxmsg": fake_oxmsg}):
+        docs = loader.load()
+
+    assert docs[0].page_content == "Just the body."
