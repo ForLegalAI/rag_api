@@ -342,6 +342,20 @@ def test_get_loader_docx_raw_text_uses_pandoc(tmp_path):
     assert file_ext == "docx"
 
 
+def test_get_loader_docx_with_msword_mime_still_loads(tmp_path):
+    """A valid .docx sent with the generic application/msword mime is NOT rejected."""
+    from langchain_community.document_loaders import Docx2txtLoader
+
+    file_path = tmp_path / "report.docx"
+    file_path.write_bytes(b"placeholder")
+
+    loader, known_type, file_ext = get_loader(
+        "report.docx", "application/msword", str(file_path)
+    )
+    assert isinstance(loader, Docx2txtLoader)
+    assert file_ext == "docx"
+
+
 def test_get_loader_legacy_doc_is_rejected(tmp_path):
     """Legacy binary .doc can't be loaded by any backend, so it's rejected clearly."""
     file_path = tmp_path / "legacy.doc"
@@ -809,6 +823,50 @@ def test_image_ocr_loader_caps_frames(tmp_path):
 
     assert client.ocr.process.call_count == 2
     assert len(docs) == 2
+
+
+def test_image_ocr_loader_normalizes_cmyk_jpeg(tmp_path):
+    """A CMYK JPEG must be normalized to PNG (not passed through), so OCR reads it."""
+    from PIL import Image
+    from app.utils import document_loader
+    from app.utils.document_loader import ImageOCRLoader
+
+    p = tmp_path / "scan.jpg"
+    Image.new("CMYK", (8, 8)).save(str(p), format="JPEG")
+
+    fake_module, client = _make_mistral_module(
+        pages=[MagicMock(index=0, markdown="text")]
+    )
+    loader = ImageOCRLoader(str(p))
+    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+        document_loader, "MISTRAL_API_KEY", "test-key"
+    ):
+        loader.load()
+
+    _, kwargs = client.ocr.process.call_args
+    # CMYK can't pass through as image/jpeg; it must be re-encoded to PNG.
+    assert kwargs["document"]["image_url"].startswith("data:image/png;base64,")
+
+
+def test_image_ocr_loader_zero_cap_means_unlimited(tmp_path):
+    """IMAGE_OCR_MAX_PAGES<=0 disables the cap rather than returning blank output."""
+    from app.utils import document_loader
+    from app.utils.document_loader import ImageOCRLoader
+
+    p = tmp_path / "scan.png"
+    _make_png(str(p))
+
+    fake_module, client = _make_mistral_module(
+        pages=[MagicMock(index=0, markdown="scanned text")]
+    )
+    loader = ImageOCRLoader(str(p))
+    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+        document_loader, "MISTRAL_API_KEY", "test-key"
+    ), patch.object(document_loader, "IMAGE_OCR_MAX_PAGES", 0):
+        docs = loader.load()
+
+    assert client.ocr.process.call_count == 1
+    assert docs[0].page_content == "scanned text"
 
 
 def test_image_ocr_loader_requires_api_key(tmp_path):

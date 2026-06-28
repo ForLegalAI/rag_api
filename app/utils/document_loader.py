@@ -182,6 +182,18 @@ def get_loader(
             loader = UnstructuredMarkdownLoader(filepath)
     elif file_ext == "epub" or file_content_type == "application/epub+zip":
         loader = UnstructuredEPubLoader(filepath)
+    elif file_ext == "docx" or file_content_type == (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ):
+        # Checked before the legacy-.doc branch so a valid .docx is never
+        # rejected just because a client sent the generic application/msword
+        # Content-Type. On the /text endpoint (raw_text=True), use pandoc so
+        # tracked changes, comments and headers/footers are preserved; the
+        # embedding path uses Docx2txtLoader.
+        if raw_text and DOCX_TEXT_USE_PANDOC:
+            loader = PandocDocxLoader(filepath)
+        else:
+            loader = Docx2txtLoader(filepath)
     elif file_ext == "doc" or file_content_type == "application/msword":
         # Legacy binary .doc (OLE2) is not supported: Docx2txtLoader only reads
         # OOXML .docx and pandoc can't read .doc either, so it could never load.
@@ -189,16 +201,6 @@ def get_loader(
         raise ValueError(
             "Legacy .doc files are not supported. Please convert the document to .docx."
         )
-    elif file_ext == "docx" or file_content_type == (
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    ):
-        # On the /text endpoint (raw_text=True), use pandoc so tracked changes,
-        # comments and headers/footers are preserved; the embedding path uses
-        # Docx2txtLoader.
-        if raw_text and DOCX_TEXT_USE_PANDOC:
-            loader = PandocDocxLoader(filepath)
-        else:
-            loader = Docx2txtLoader(filepath)
     elif file_ext == "eml" or file_content_type == "message/rfc822":
         loader = EmailLoader(filepath)
     elif file_ext == "msg" or file_content_type == "application/vnd.ms-outlook":
@@ -424,7 +426,14 @@ class ImageOCRLoader:
 
         with Image.open(self.filepath) as img:
             fmt = (img.format or "").upper()
-            if getattr(img, "n_frames", 1) == 1 and fmt in ("PNG", "JPEG"):
+            # Only pass through when the bytes are already in a mode OCR reads
+            # reliably; CMYK/palette/16-bit/RGBA etc. still go through Pillow's
+            # RGB normalization below.
+            if (
+                getattr(img, "n_frames", 1) == 1
+                and fmt in ("PNG", "JPEG")
+                and img.mode in ("RGB", "L")
+            ):
                 with open(self.filepath, "rb") as f:
                     raw = f.read()
                 mime = "image/png" if fmt == "PNG" else "image/jpeg"
@@ -444,7 +453,8 @@ class ImageOCRLoader:
 
         documents: List[Document] = []
         for mime, b64 in self._iter_image_payloads():
-            if len(documents) >= IMAGE_OCR_MAX_PAGES:
+            # IMAGE_OCR_MAX_PAGES <= 0 means "no cap" rather than "process nothing".
+            if 0 < IMAGE_OCR_MAX_PAGES <= len(documents):
                 logger.warning(
                     "Image %s exceeds IMAGE_OCR_MAX_PAGES=%d; remaining frames skipped",
                     self.filepath,
