@@ -342,18 +342,22 @@ def test_get_loader_docx_raw_text_uses_pandoc(tmp_path):
     assert file_ext == "docx"
 
 
-def test_get_loader_legacy_doc_raw_text_stays_docx2txt(tmp_path):
-    """pandoc can't read legacy binary .doc, so it stays on Docx2txtLoader even on /text."""
-    from langchain_community.document_loaders import Docx2txtLoader
-
+def test_get_loader_legacy_doc_is_rejected(tmp_path):
+    """Legacy binary .doc can't be loaded by any backend, so it's rejected clearly."""
     file_path = tmp_path / "legacy.doc"
     file_path.write_bytes(b"placeholder")
 
-    loader, _, file_ext = get_loader(
-        "legacy.doc", "application/msword", str(file_path), raw_text=True
-    )
-    assert isinstance(loader, Docx2txtLoader)
-    assert file_ext == "doc"
+    with pytest.raises(ValueError, match="Legacy .doc files are not supported"):
+        get_loader("legacy.doc", "application/msword", str(file_path))
+
+
+def test_get_loader_legacy_doc_rejected_even_with_markdown_mime(tmp_path):
+    """A markdown Content-Type must not route .doc into the markdown loader either."""
+    file_path = tmp_path / "legacy.doc"
+    file_path.write_bytes(b"placeholder")
+
+    with pytest.raises(ValueError, match="Legacy .doc files are not supported"):
+        get_loader("legacy.doc", "text/markdown", str(file_path), raw_text=True)
 
 
 def test_pandoc_docx_loader_passes_track_changes_and_builds_document(tmp_path):

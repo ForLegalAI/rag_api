@@ -60,7 +60,8 @@ pypandoc.convert_file(path, to="markdown", format="docx",
 
 ### Key design decisions (need your input — see Open Questions)
 - **`.docx` only.** pandoc reads OOXML `.docx`, **not** legacy binary `.doc`.
-  `.doc` stays on `Docx2txtLoader`.
+  (Update: `.doc` is now **rejected** with a clear error — see Code-review fixes —
+  since neither pandoc nor Docx2txtLoader can read the binary OLE2 format.)
 - **`--track-changes=all`** keeps insertions *and* deletions and is the only mode
   that emits comments. (`accept` = final text, `reject` = original; both drop comments.)
 - **Output format.** `markdown` preserves change/comment annotations as spans
@@ -230,6 +231,15 @@ Deferred (larger refactors, noted not done): a single extension→content-type�
 registry (the routing lists are still maintained per-branch), generalizing the
 `raw_text` per-format special-casing, and a shared base loader for the
 `lazy_load`/`_temp_filepath` boilerplate.
+
+## Legacy `.doc` dropped
+`.doc` (binary OLE2 Word) was routed to `Docx2txtLoader`, which only reads OOXML
+`.docx` — so it never actually loaded and failed later with a confusing
+"not a zip file" error. `get_loader` now **rejects `.doc`** up front with a clear
+`ValueError` ("Legacy .doc files are not supported. Please convert the document to
+.docx."), which the routes surface as a 400. `doc` stays in
+`_BINARY_FILE_EXTENSIONS` so a stray `text/markdown` Content-Type still reaches the
+rejection rather than the markdown loader.
 
 ## Implementation status — DONE
 - `app/config.py`: `DOCX_TEXT_USE_PANDOC`, `DOCX_TEXT_TRACK_CHANGES`, `EMAIL_INCLUDE_HEADERS`.

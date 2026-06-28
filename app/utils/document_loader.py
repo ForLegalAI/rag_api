@@ -182,14 +182,20 @@ def get_loader(
             loader = UnstructuredMarkdownLoader(filepath)
     elif file_ext == "epub" or file_content_type == "application/epub+zip":
         loader = UnstructuredEPubLoader(filepath)
-    elif file_ext in ["doc", "docx"] or file_content_type in [
-        "application/msword",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ]:
-        # On the /text endpoint (raw_text=True), use pandoc for .docx so tracked
-        # changes and comments are preserved. pandoc only reads OOXML .docx, not
-        # legacy binary .doc, so .doc keeps using Docx2txtLoader.
-        if raw_text and DOCX_TEXT_USE_PANDOC and file_ext == "docx":
+    elif file_ext == "doc" or file_content_type == "application/msword":
+        # Legacy binary .doc (OLE2) is not supported: Docx2txtLoader only reads
+        # OOXML .docx and pandoc can't read .doc either, so it could never load.
+        # Reject clearly instead of failing later with a confusing error.
+        raise ValueError(
+            "Legacy .doc files are not supported. Please convert the document to .docx."
+        )
+    elif file_ext == "docx" or file_content_type == (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ):
+        # On the /text endpoint (raw_text=True), use pandoc so tracked changes,
+        # comments and headers/footers are preserved; the embedding path uses
+        # Docx2txtLoader.
+        if raw_text and DOCX_TEXT_USE_PANDOC:
             loader = PandocDocxLoader(filepath)
         else:
             loader = Docx2txtLoader(filepath)
