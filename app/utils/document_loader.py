@@ -475,6 +475,26 @@ class ImageOCRLoader:
         yield from self.load()
 
 
+def _decode_mime_words(value: Optional[str]) -> Optional[str]:
+    """Decode RFC 2047 encoded-word header values (e.g. ``=?utf-8?q?...?=``).
+
+    Outlook ``.msg`` transport headers store non-ASCII values (subjects, display
+    names) as encoded-words. Unlike the ``.eml`` path — where
+    ``email.policy.default`` decodes headers for us — python-oxmsg hands back the
+    raw header string, so a Czech subject would otherwise be prepended verbatim
+    as ``=?utf-8?q?Va=C5=A1e...?=``. Returns the input unchanged when it holds no
+    encoded-words or can't be decoded.
+    """
+    if not value:
+        return value
+    try:
+        from email.header import decode_header, make_header
+
+        return str(make_header(decode_header(value)))
+    except Exception:  # pragma: no cover - defensive: never block extraction
+        return value
+
+
 def _format_email_headers(headers: dict) -> str:
     """Build a header block from available email header values.
 
@@ -671,7 +691,9 @@ class OutlookMsgLoader:
             headers = {str(k).lower(): v for k, v in raw_headers.items()}
 
             def hdr(name, fallback=None):
-                return headers.get(name.lower()) or fallback
+                # Transport-header values may be RFC 2047 encoded-words; decode
+                # them. The structured-attribute fallbacks are already decoded.
+                return _decode_mime_words(headers.get(name.lower())) or fallback
 
             sent_date = getattr(msg, "sent_date", None)
             header_block = _format_email_headers(
