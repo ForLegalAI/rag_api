@@ -1,0 +1,11 @@
+# Compose override to build/run the LITE image instead of the full Dockerfile.
+# Usage:
+#   docker compose -f docker-compose.yaml -f docker-compose.lite.yaml up -d --build
+#
+# It only overrides how the `fastapi` service is built (Dockerfile.lite); the db
+# service, ports, env_file and volumes come from docker-compose.yaml unchanged.
+services:
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile.lite
