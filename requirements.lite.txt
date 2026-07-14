@@ -18,22 +18,22 @@ openpyxl==3.1.5
 docx2txt==0.9
 python-docx==1.1.2  # .docx header/footer extraction (pandoc drops them)
 pypandoc==1.15
-python-oxmsg>=0.0.2,<0.1  # .msg (Outlook) extraction; also a transitive of unstructured
-Pillow>=10.0.0  # normalize standalone images (incl. multi-page TIFF) for OCR
+python-oxmsg==0.0.2  # .msg (Outlook) extraction; also a transitive of unstructured
+Pillow==12.3.0  # normalize standalone images (incl. multi-page TIFF) for OCR
 PyJWT==2.13.0
 asyncpg==0.29.0
 python-multipart==0.0.32
 aiofiles==24.1.0
-pymongo>=4.12.0,<5
+pymongo==4.17.0
 langchain-mongodb==0.11.0
 cryptography==46.0.7
 python-magic==0.4.27
 python-pptx==1.0.2
 xlrd==2.0.2
 langchain-aws==1.6.0
-boto3>=1.42.42,<2
+boto3==1.43.48
 chardet==5.2.0
 langchain-ollama==1.1.0
-tenacity>=9.0.0
-msoffcrypto-tool>=6.0.0,<7
-mistralai>=1.0.2
+tenacity==9.1.4
+msoffcrypto-tool==6.0.0
+mistralai==2.6.0
