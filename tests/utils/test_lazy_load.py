@@ -41,7 +41,9 @@ def _mock_mistral_ocr(num_pages=1):
     ]
     client.ocr.process.return_value = response
     fake_module.Mistral.return_value = client
-    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(
         document_loader, "MISTRAL_API_KEY", "test-key"
     ), patch.object(
         document_loader.SafePyPDFLoader, "_encode_pdf_b64", return_value="b64"

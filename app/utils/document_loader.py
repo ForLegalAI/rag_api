@@ -303,16 +303,11 @@ def _mistral_ocr_client():
     """
     # Lazy import to avoid hard dependency at import time
     try:
-        from mistralai import Mistral
-    except ImportError:
-        # mistralai >= 2.0 turned the top-level package into a namespace and
-        # moved the SDK into the ``mistralai.client`` subpackage.
-        try:
-            from mistralai.client import Mistral
-        except Exception as e:
-            raise RuntimeError(
-                "mistralai package is required for OCR. Please install 'mistralai' and set MISTRAL_API_KEY."
-            ) from e
+        from mistralai.client import Mistral
+    except Exception as e:
+        raise RuntimeError(
+            "mistralai package is required for OCR. Please install 'mistralai>=2.0.0' and set MISTRAL_API_KEY."
+        ) from e
 
     if not MISTRAL_API_KEY:
         raise RuntimeError(

@@ -96,7 +96,7 @@ def test_safe_pdf_loader_lazy_load():
 
 
 def _make_mistral_module(pages=None, raise_exc=None):
-    """Build a fake ``mistralai`` module whose ``Mistral().ocr.process`` is stubbed.
+    """Build a fake ``mistralai.client`` module whose ``Mistral().ocr.process`` is stubbed.
 
     Returns ``(fake_module, client)`` so callers can both inject the module via
     ``sys.modules`` and make assertions on the OCR client.
@@ -124,7 +124,9 @@ def test_safe_pdf_loader_ocr_maps_pages():
     fake_module, client = _make_mistral_module(pages=[page0, page1])
 
     loader = SafePyPDFLoader("dummy.pdf")
-    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(
         document_loader, "MISTRAL_API_KEY", "test-key"
     ), patch.object(SafePyPDFLoader, "_encode_pdf_b64", return_value="b64data"):
         result = loader.load()
@@ -155,7 +157,9 @@ def test_safe_pdf_loader_empty_pages_returns_placeholder():
     fake_module, _ = _make_mistral_module(pages=[])
 
     loader = SafePyPDFLoader("dummy.pdf")
-    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(
         document_loader, "MISTRAL_API_KEY", "test-key"
     ), patch.object(SafePyPDFLoader, "_encode_pdf_b64", return_value="b64data"):
         result = loader.load()
@@ -173,7 +177,9 @@ def test_safe_pdf_loader_ocr_error_propagates():
     fake_module, _ = _make_mistral_module(raise_exc=RuntimeError("OCR boom"))
 
     loader = SafePyPDFLoader("dummy.pdf")
-    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(
         document_loader, "MISTRAL_API_KEY", "test-key"
     ), patch.object(SafePyPDFLoader, "_encode_pdf_b64", return_value="b64data"):
         with pytest.raises(RuntimeError, match="OCR boom"):
@@ -188,7 +194,9 @@ def test_safe_pdf_loader_requires_api_key():
     fake_module, _ = _make_mistral_module(pages=[])
 
     loader = SafePyPDFLoader("dummy.pdf")
-    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(
         document_loader, "MISTRAL_API_KEY", ""
     ):
         with pytest.raises(RuntimeError, match="MISTRAL_API_KEY"):
@@ -766,7 +774,9 @@ def test_image_ocr_loader_single_image(tmp_path):
     )
 
     loader = ImageOCRLoader(str(p))
-    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(
         document_loader, "MISTRAL_API_KEY", "test-key"
     ):
         docs = loader.load()
@@ -792,7 +802,9 @@ def test_image_ocr_loader_multipage_tiff_yields_one_doc_per_frame(tmp_path):
     )
 
     loader = ImageOCRLoader(str(p))
-    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(
         document_loader, "MISTRAL_API_KEY", "test-key"
     ):
         docs = loader.load()
@@ -816,7 +828,9 @@ def test_image_ocr_loader_caps_frames(tmp_path):
     )
 
     loader = ImageOCRLoader(str(p))
-    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(
         document_loader, "MISTRAL_API_KEY", "test-key"
     ), patch.object(document_loader, "IMAGE_OCR_MAX_PAGES", 2):
         docs = loader.load()
@@ -838,7 +852,9 @@ def test_image_ocr_loader_normalizes_cmyk_jpeg(tmp_path):
         pages=[MagicMock(index=0, markdown="text")]
     )
     loader = ImageOCRLoader(str(p))
-    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(
         document_loader, "MISTRAL_API_KEY", "test-key"
     ):
         loader.load()
@@ -860,7 +876,9 @@ def test_image_ocr_loader_zero_cap_means_unlimited(tmp_path):
         pages=[MagicMock(index=0, markdown="scanned text")]
     )
     loader = ImageOCRLoader(str(p))
-    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(
         document_loader, "MISTRAL_API_KEY", "test-key"
     ), patch.object(document_loader, "IMAGE_OCR_MAX_PAGES", 0):
         docs = loader.load()
@@ -878,7 +896,9 @@ def test_image_ocr_loader_requires_api_key(tmp_path):
 
     fake_module, _ = _make_mistral_module(pages=[])
     loader = ImageOCRLoader(str(p))
-    with patch.dict("sys.modules", {"mistralai": fake_module}), patch.object(
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(
         document_loader, "MISTRAL_API_KEY", ""
     ):
         with pytest.raises(RuntimeError, match="MISTRAL_API_KEY"):
