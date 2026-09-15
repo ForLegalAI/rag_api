@@ -236,6 +236,58 @@ DOCX_TEXT_INCLUDE_HEADERS_FOOTERS = (
     get_env_variable("DOCX_TEXT_INCLUDE_HEADERS_FOOTERS", "True").lower() == "true"
 )
 
+# How pandoc renders .docx tables in the extracted Markdown.
+#   "compact" (default): pipe tables, falling back to HTML <table> only for cells
+#       holding block content. Cells are never padded.
+#   "grid": pandoc's default grid/simple tables, which pad every cell of every row
+#       to the width of the longest line in that column. Combined with --wrap=none
+#       a single long clause can blow a bilingual contract table up to many times
+#       its content size; kept as an escape hatch. Reproducing the pre-fix output
+#       byte for byte also needs DOCX_TEXT_CLEANUP=False and
+#       DOCX_TEXT_STRIP_HEADING_ANCHORS=False, which are independent of this.
+# Unrecognised values fall back to "compact" with a warning rather than failing
+# boot: this knob is cosmetic, unlike VECTOR_DB_TYPE. The warning matters because
+# "grid" is the escape hatch — a typo or a stray space in an .env file would
+# otherwise silently leave the caller on the very behaviour they opted out of.
+DOCX_TEXT_TABLE_STYLES = ("compact", "grid")
+DOCX_TEXT_TABLE_STYLE = (
+    get_env_variable("DOCX_TEXT_TABLE_STYLE", "compact").strip().lower()
+)
+if DOCX_TEXT_TABLE_STYLE not in DOCX_TEXT_TABLE_STYLES:
+    logger.warning(
+        "Unrecognised DOCX_TEXT_TABLE_STYLE %r; expected one of %s. Using 'compact'.",
+        DOCX_TEXT_TABLE_STYLE,
+        ", ".join(DOCX_TEXT_TABLE_STYLES),
+    )
+    DOCX_TEXT_TABLE_STYLE = "compact"
+
+# Post-process the pandoc Markdown to remove noise that carries no content:
+# table columns that are empty in every row, empty tracked-change spans (a deleted
+# space still costs ~70 bytes of author/date metadata), runs of blank lines, and
+# invisible characters (NBSP, soft hyphen, zero-width). Tracked changes that do
+# carry text keep their author and date untouched.
+DOCX_TEXT_CLEANUP = get_env_variable("DOCX_TEXT_CLEANUP", "True").lower() == "true"
+
+# Grid tables encode their columns as character positions, so any cleanup that
+# shortens a row leaves its "|" delimiters no longer under the "+---+" rule. The
+# two settings are independent by design, and someone reaching for the grid escape
+# hatch keeps cleanup's default "True" without meaning to, so say so once at boot.
+if DOCX_TEXT_TABLE_STYLE == "grid" and DOCX_TEXT_CLEANUP:
+    logger.warning(
+        "DOCX_TEXT_TABLE_STYLE=grid with DOCX_TEXT_CLEANUP=True: cleanup can shift "
+        "a grid table's column boundaries. Set DOCX_TEXT_CLEANUP=False alongside it."
+    )
+
+# Drop the heading anchors pandoc derives from Word bookmarks ("# Heading
+# {#_Toc123456789}"). These are Word-internal TOC/cross-reference ids, not content.
+DOCX_TEXT_STRIP_HEADING_ANCHORS = (
+    get_env_variable("DOCX_TEXT_STRIP_HEADING_ANCHORS", "True").lower() == "true"
+)
+
+# Drop a Word-generated table of contents (the block of links to #_Toc bookmarks).
+# Off by default: in some documents the TOC is the only outline of the agreement.
+DOCX_TEXT_DROP_TOC = get_env_variable("DOCX_TEXT_DROP_TOC", "False").lower() == "true"
+
 # Email (.eml/.msg) extraction: prepend key headers (From/To/Subject/Date) to the
 # extracted body text so downstream parsing has the message context.
 EMAIL_INCLUDE_HEADERS = (

@@ -401,7 +401,7 @@ def test_pandoc_docx_loader_passes_track_changes_and_builds_document(tmp_path):
     assert docs[0].metadata["source"] == str(file_path)
 
     _, kwargs = fake_pypandoc.convert_file.call_args
-    assert kwargs["to"] == "markdown"
+    assert kwargs["to"].startswith("markdown")
     assert kwargs["format"] == "docx"
     assert "--track-changes=all" in kwargs["extra_args"]
 
@@ -487,6 +487,507 @@ def test_pandoc_docx_loader_headers_footers_disabled(tmp_path):
 
     assert docs[0].page_content == "Body markdown only."
     assert "CONFIDENTIAL" not in docs[0].page_content
+
+
+# ---------------------------------------------------------------------------
+# DOCX table compaction and Markdown cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_pandoc_markdown_format_compact_disables_padded_tables():
+    """Compact style turns off the table syntaxes that pad every cell."""
+    from app.utils.document_loader import _pandoc_markdown_format
+
+    fmt = _pandoc_markdown_format(table_style="compact", strip_heading_anchors=True)
+    assert fmt.startswith("markdown")
+    for extension in ("grid_tables", "multiline_tables", "simple_tables"):
+        assert f"-{extension}" in fmt
+    assert "-header_attributes" in fmt
+
+
+def test_pandoc_markdown_format_grid_is_pandoc_default():
+    """Grid style restores pandoc's own writer, as an escape hatch."""
+    from app.utils.document_loader import _pandoc_markdown_format
+
+    assert (
+        _pandoc_markdown_format(table_style="grid", strip_heading_anchors=False)
+        == "markdown"
+    )
+
+
+def test_pandoc_docx_loader_requests_compact_tables(tmp_path):
+    from app.utils.document_loader import PandocDocxLoader
+
+    p = tmp_path / "doc.docx"
+    p.write_bytes(b"placeholder")
+
+    fake_pypandoc = MagicMock()
+    fake_pypandoc.convert_file.return_value = "body"
+
+    loader = PandocDocxLoader(str(p), include_headers_footers=False)
+    with patch.dict("sys.modules", {"pypandoc": fake_pypandoc}):
+        loader.load()
+
+    _, kwargs = fake_pypandoc.convert_file.call_args
+    assert "-grid_tables" in kwargs["to"]
+    assert "--wrap=none" in kwargs["extra_args"]
+
+
+def test_pandoc_docx_loader_grid_style_opt_out(tmp_path):
+    from app.utils.document_loader import PandocDocxLoader
+
+    p = tmp_path / "doc.docx"
+    p.write_bytes(b"placeholder")
+
+    fake_pypandoc = MagicMock()
+    fake_pypandoc.convert_file.return_value = "body"
+
+    loader = PandocDocxLoader(
+        str(p),
+        include_headers_footers=False,
+        table_style="grid",
+        strip_heading_anchors=False,
+    )
+    with patch.dict("sys.modules", {"pypandoc": fake_pypandoc}):
+        loader.load()
+
+    _, kwargs = fake_pypandoc.convert_file.call_args
+    assert kwargs["to"] == "markdown"
+
+
+def test_drop_empty_table_columns_removes_unused_columns():
+    """A bilingual table with spare gutter columns keeps only the filled ones."""
+    from app.utils.document_loader import _drop_empty_table_columns
+
+    table = (
+        "| výpověď | Notice of Termination |  |  |\n"
+        "|---------|-----------------------|--|--|\n"
+        "| česky   | in English            |  |  |\n"
+    )
+    out = _drop_empty_table_columns(table)
+
+    assert "výpověď" in out and "Notice of Termination" in out
+    assert "česky" in out and "in English" in out
+    for line in out.strip().split("\n"):
+        assert line.count("|") == 3, line
+
+
+def test_drop_empty_table_columns_keeps_partially_filled_column():
+    from app.utils.document_loader import _drop_empty_table_columns
+
+    table = "| a | b |\n|---|---|\n| x |   |\n|   | y |\n"
+    assert _drop_empty_table_columns(table) == table
+
+
+def test_drop_empty_table_columns_keeps_spacer_rows_intact():
+    """A row of empty cells is a spacer, and must not be rewritten as a rule."""
+    from app.utils.document_loader import _drop_empty_table_columns
+
+    table = "| a | b |  |\n|---|---|--|\n|   |   |  |\n| c | d |  |\n"
+    out = _drop_empty_table_columns(table).strip().split("\n")
+
+    assert out[1] == "| --- | --- |"  # the one rule the table had
+    assert out[2] == "|  |  |"  # spacer row stays a spacer row
+    assert out[3] == "| c | d |"
+
+
+def test_drop_empty_table_columns_leaves_non_tables_untouched():
+    from app.utils.document_loader import _drop_empty_table_columns
+
+    text = "Plain paragraph.\n\n<table>\n<tr><td>a</td><td></td></tr>\n</table>\n"
+    assert _drop_empty_table_columns(text) == text
+
+
+def test_drop_empty_table_columns_respects_escaped_pipes():
+    """A literal pipe in cell text must not be read as a column boundary."""
+    from app.utils.document_loader import _drop_empty_table_columns
+
+    table = "| a \\| b | c |  |\n|--------|---|--|\n| d      | e |  |\n"
+    out = _drop_empty_table_columns(table)
+
+    assert "a \\| b" in out
+    assert out.strip().split("\n")[0].count("|") == 4  # 2 columns + escaped pipe
+
+
+def test_clean_pandoc_markdown_strips_empty_change_spans():
+    """A deleted space costs ~70 bytes of metadata and says nothing; drop it."""
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    text = (
+        '§ 52 písm. g) []{.deletion author="Jaroslav Skubal" '
+        'date="2026-09-14T17:08:00Z"}a f) zákoníku práce'
+    )
+    out = _clean_pandoc_markdown(text)
+
+    assert ".deletion" not in out
+    assert out == "§ 52 písm. g) a f) zákoníku práce"
+
+
+def test_clean_pandoc_markdown_preserves_tracked_changes_with_text():
+    """Insertions/deletions that carry text keep their author and date verbatim."""
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    text = (
+        '[inserted]{.insertion author="Jaroslav Skubal" date="2026-09-14T17:08:00Z"} '
+        '[deleted]{.deletion author="Jaroslav Skubal" date="2026-09-14T17:08:00Z"}'
+    )
+    assert _clean_pandoc_markdown(text) == text
+
+
+def test_clean_pandoc_markdown_preserves_comment_anchors():
+    """Comment ranges need their (empty) end anchor to stay delimited."""
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    text = (
+        '[clause]{.comment-start id="1" author="Jaroslav Skubal"} text '
+        '[]{.comment-end id="1"}'
+    )
+    assert _clean_pandoc_markdown(text) == text
+
+
+def test_clean_pandoc_markdown_collapses_blank_lines_and_invisibles():
+    """Word spacer paragraphs and invisible characters carry no content."""
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    nbsp, soft_hyphen, zero_width = "\u00a0", "\u00ad", "\u200b"
+    text = f"First\n\n\n\n\nSecond{nbsp}para{soft_hyphen}graph{zero_width}."
+
+    # NBSP becomes a real space so "§ 52" stays searchable; the soft hyphen and
+    # zero-width space are dropped, leaving the single word Word meant to render.
+    assert _clean_pandoc_markdown(text) == "First\n\nSecond paragraph."
+
+
+def test_clean_pandoc_markdown_keeps_toc_by_default():
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    text = "[Article 1 Definitions](#_Toc123456789)\n\nBody."
+    assert "#_Toc123456789" in _clean_pandoc_markdown(text)
+    assert "Article 1" not in _clean_pandoc_markdown(text, drop_toc=True)
+
+
+def test_pandoc_docx_loader_cleanup_can_be_disabled(tmp_path):
+    from app.utils.document_loader import PandocDocxLoader
+
+    p = tmp_path / "doc.docx"
+    p.write_bytes(b"placeholder")
+    raw = 'text []{.deletion author="A" date="D"}here\n\n\n\nmore'
+
+    fake_pypandoc = MagicMock()
+    fake_pypandoc.convert_file.return_value = raw
+
+    loader = PandocDocxLoader(str(p), include_headers_footers=False, cleanup=False)
+    with patch.dict("sys.modules", {"pypandoc": fake_pypandoc}):
+        docs = loader.load()
+
+    assert docs[0].page_content == raw
+
+
+def test_pandoc_docx_loader_cleans_output_by_default(tmp_path):
+    from app.utils.document_loader import PandocDocxLoader
+
+    p = tmp_path / "doc.docx"
+    p.write_bytes(b"placeholder")
+
+    fake_pypandoc = MagicMock()
+    fake_pypandoc.convert_file.return_value = (
+        'text []{.deletion author="A" date="D"}here'
+    )
+
+    loader = PandocDocxLoader(str(p), include_headers_footers=False)
+    with patch.dict("sys.modules", {"pypandoc": fake_pypandoc}):
+        docs = loader.load()
+
+    assert docs[0].page_content == "text here"
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("4", True),
+        ("- 12 -", True),
+        ("Page 4 of 10", True),
+        ("Strana 4/10", True),
+        ("Matter No. 12345", False),
+        ("12345", False),  # a numeric matter number is not a page number
+        ("§ 3", False),  # an article running header, not a page number
+        ("(5)", False),
+        ("PRIVILEGED & CONFIDENTIAL", False),
+        ("Article 5", False),
+    ],
+)
+def test_is_page_number_only(text, expected):
+    from app.utils.document_loader import _is_page_number_only
+
+    assert _is_page_number_only(text) is expected
+
+
+def test_extract_docx_headers_footers_skips_page_numbers(tmp_path):
+    """A footer holding only a page number adds no content, so it is dropped."""
+    from app.utils.document_loader import _extract_docx_headers_footers
+
+    p = tmp_path / "doc.docx"
+    _make_docx_with_header_footer(str(p), "PRIVILEGED & CONFIDENTIAL", "4")
+
+    block = _extract_docx_headers_footers(str(p))
+    assert "[Header] PRIVILEGED & CONFIDENTIAL" in block
+    assert "[Footer]" not in block
+
+
+def test_drop_toc_keeps_in_body_cross_references():
+    """Word reuses _Toc bookmarks for cross-references; a clause is not a TOC entry."""
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    clause = (
+        "As set out in [Section 3.2 (Termination)](#_Toc123456789) below, the "
+        "Employer may terminate this Agreement immediately."
+    )
+    assert _clean_pandoc_markdown(clause, drop_toc=True) == clause
+
+
+def test_drop_toc_removes_generated_toc_lines():
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    text = (
+        "[Article 1 Definitions](#_Toc1) 3\n"
+        "[Article 2 Term](#_Toc2) 7\n"
+        "\n"
+        "Body text."
+    )
+    assert _clean_pandoc_markdown(text, drop_toc=True) == "Body text."
+
+
+def test_cleanup_drops_column_holding_only_empty_change_spans():
+    """The noise metadata is stripped before columns are judged empty."""
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    table = (
+        '| Term | Meaning | []{.deletion author="A" date="D"} |\n'
+        "|---|---|---|\n"
+        '| Employer | means the company | []{.deletion author="A" date="D"} |\n'
+    )
+    out = _clean_pandoc_markdown(table)
+
+    assert ".deletion" not in out
+    for line in out.strip().split("\n"):
+        assert line.count("|") == 3, line
+
+
+def test_drop_empty_table_columns_keeps_dash_only_data_row():
+    """Only the rule under the header is a rule; later dashes are cell content."""
+    from app.utils.document_loader import _drop_empty_table_columns
+
+    table = "| A | B |  |\n|---|---|--|\n| x | y |  |\n| --- | ---- |  |\n"
+    out = _drop_empty_table_columns(table).strip().split("\n")
+
+    assert out[1] == "| --- | --- |"  # the header rule, compacted
+    assert out[3] == "| --- | ---- |"  # data row, verbatim
+
+
+def test_drop_empty_table_columns_skips_fenced_code_blocks():
+    """Pipe-looking lines inside a code fence are content, not a table."""
+    from app.utils.document_loader import _drop_empty_table_columns
+
+    text = "```\n| id | name |  |\n| 1  | x    |  |\n```\n"
+    assert _drop_empty_table_columns(text) == text
+
+
+def test_clean_pandoc_markdown_strips_merged_empty_change_spans():
+    """Two adjacent empty deletions are merged by pandoc into "[ ]{...}"."""
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    text = 'g) [ ]{.deletion author="Jaroslav Skubal" date="2026-09-14T17:08:00Z"}a f)'
+    assert _clean_pandoc_markdown(text) == "g) a f)"
+
+
+def test_cleanup_failure_falls_back_to_uncleaned_text(tmp_path):
+    """A bug in cleanup must not cost the caller an extraction pandoc completed."""
+    from app.utils import document_loader
+    from app.utils.document_loader import PandocDocxLoader
+
+    p = tmp_path / "doc.docx"
+    p.write_bytes(b"placeholder")
+
+    fake_pypandoc = MagicMock()
+    fake_pypandoc.convert_file.return_value = "| a | b |\n|---|---|\n"
+
+    loader = PandocDocxLoader(str(p), include_headers_footers=False)
+    with patch.dict("sys.modules", {"pypandoc": fake_pypandoc}), patch.object(
+        document_loader, "_clean_pandoc_markdown", side_effect=RuntimeError("boom")
+    ):
+        docs = loader.load()
+
+    assert docs[0].page_content == "| a | b |\n|---|---|\n"
+
+
+def test_extraction_log_line_omits_the_file_path(tmp_path, caplog):
+    """Upload paths carry the client's filename, which names matters and parties."""
+    import logging
+
+    from app.utils.document_loader import PandocDocxLoader
+
+    p = tmp_path / "Smith_v_Jones_Settlement.docx"
+    p.write_bytes(b"placeholder")
+
+    fake_pypandoc = MagicMock()
+    fake_pypandoc.convert_file.return_value = "Body."
+
+    loader = PandocDocxLoader(str(p), include_headers_footers=False)
+    with caplog.at_level(logging.INFO), patch.dict(
+        "sys.modules", {"pypandoc": fake_pypandoc}
+    ):
+        loader.load()
+
+    assert any("Chars:" in record.message for record in caplog.records)
+    assert not any("Smith_v_Jones" in record.getMessage() for record in caplog.records)
+
+
+def test_clean_pandoc_markdown_leaves_double_spaces_elsewhere_on_the_line():
+    """Removing a noise span must not reflow whitespace that is document content."""
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    text = 'Use `a  b` here []{.deletion author="A" date="D"}and "quoted  text".'
+    assert _clean_pandoc_markdown(text) == 'Use `a  b` here and "quoted  text".'
+
+
+def test_cleanup_drops_column_holding_only_invisible_characters():
+    """A cell of nothing but a zero-width space is an empty cell."""
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    table = "| Term | Meaning | \u200b |\n|---|---|---|\n| Employer | the company | \u200b |\n"
+    out = _clean_pandoc_markdown(table)
+
+    for line in out.strip().split("\n"):
+        assert line.count("|") == 3, line
+
+
+def test_grid_style_alone_still_strips_heading_anchors():
+    """The two knobs are independent: restoring the old output verbatim needs both."""
+    from app.utils.document_loader import _pandoc_markdown_format
+
+    assert (
+        _pandoc_markdown_format(table_style="grid", strip_heading_anchors=True)
+        == "markdown-header_attributes"
+    )
+
+
+# --- end-to-end, with a real pandoc binary ---------------------------------
+
+
+def _pandoc_available() -> bool:
+    try:
+        import pypandoc
+
+        pypandoc.get_pandoc_version()
+        return True
+    except Exception:
+        return False
+
+
+def _make_bilingual_contract(path):
+    """A bilingual contract laid out as one long table, as legal offices write them."""
+    from docx import Document as Docx
+
+    long_cs = (
+        "Zaměstnavatel tímto dává zaměstnanci výpověď z pracovního poměru z důvodu "
+        "uvedeného v ustanovení § 52 písm. g) zákoníku práce, tedy pro závažné porušení "
+        "povinnosti vyplývající z právních předpisů vztahujících se k vykonávané práci."
+    )
+    long_en = (
+        "The Employer hereby gives the Employee notice of termination of employment on "
+        "the grounds set out in Section 52(g) of the Labour Code, i.e. for a serious "
+        "breach of an obligation arising from legal regulations relating to the work."
+    )
+
+    doc = Docx()
+    table = doc.add_table(rows=0, cols=4)
+    for i in range(1, 31):
+        row = table.add_row()
+        if i % 8 == 0:
+            row.cells[0].text = f"{i}. {long_cs}"
+            row.cells[1].text = f"{i}. {long_en}"
+        else:
+            row.cells[0].text = f"{i}. Smluvní strany se dohodly."
+            row.cells[1].text = f"{i}. The Parties have agreed."
+    doc.save(path)
+
+
+@pytest.mark.skipif(not _pandoc_available(), reason="pandoc binary not available")
+def test_compact_tables_shrink_bilingual_contract(tmp_path):
+    """Compact extraction is a fraction of the grid form and loses no content."""
+    from app.utils.document_loader import PandocDocxLoader
+
+    p = tmp_path / "contract.docx"
+    _make_bilingual_contract(str(p))
+
+    grid = (
+        PandocDocxLoader(
+            str(p),
+            include_headers_footers=False,
+            table_style="grid",
+            cleanup=False,
+            strip_heading_anchors=False,
+        )
+        .load()[0]
+        .page_content
+    )
+    compact = (
+        PandocDocxLoader(str(p), include_headers_footers=False).load()[0].page_content
+    )
+
+    assert len(compact) < len(grid) / 2
+    # No cell is padded out to the width of the longest line in its column.
+    assert max(len(line) for line in compact.split("\n")) < 700
+    for probe in (
+        "Smluvní strany se dohodly",
+        "The Parties have agreed",
+        "§ 52 písm. g) zákoníku práce",
+        "30\\. Smluvní strany",
+    ):
+        assert probe in compact
+
+
+@pytest.mark.skipif(not _pandoc_available(), reason="pandoc binary not available")
+def test_compact_tables_keep_tracked_changes(tmp_path):
+    """Redlines survive compaction, in pipe tables and in the HTML fallback alike."""
+    from app.utils.document_loader import PandocDocxLoader
+    from docx import Document as Docx
+
+    p = tmp_path / "redline.docx"
+    doc = Docx()
+    doc.add_paragraph("Clause one.")
+    doc.save(str(p))
+
+    _inject_tracked_change(str(p))
+
+    text = (
+        PandocDocxLoader(str(p), include_headers_footers=False).load()[0].page_content
+    )
+    assert "VLOZENO" in text and "SMAZANO" in text
+    assert "insertion" in text and "deletion" in text
+    assert "Jaroslav Skubal" in text
+
+
+def _inject_tracked_change(path):
+    """Add one w:ins and one w:del run to a .docx (python-docx can't author them)."""
+    import shutil
+    import zipfile
+
+    source = f"{path}.orig"
+    shutil.move(path, source)
+    revision = (
+        '<w:p><w:ins w:id="777" w:author="Jaroslav Skubal" w:date="2026-09-14T17:08:00Z">'
+        "<w:r><w:t>VLOZENO</w:t></w:r></w:ins>"
+        '<w:del w:id="778" w:author="Jaroslav Skubal" w:date="2026-09-14T17:08:00Z">'
+        "<w:r><w:delText>SMAZANO</w:delText></w:r></w:del></w:p>"
+    )
+    with zipfile.ZipFile(source) as zin, zipfile.ZipFile(path, "w") as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "word/document.xml":
+                xml = data.decode("utf-8")
+                marker = "<w:sectPr" if "<w:sectPr" in xml else "</w:body>"
+                data = xml.replace(marker, revision + marker, 1).encode("utf-8")
+            zout.writestr(item, data)
 
 
 # ---------------------------------------------------------------------------

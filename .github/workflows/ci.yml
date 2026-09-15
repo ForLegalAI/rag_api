@@ -26,6 +26,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
+      - name: Install pandoc
+        # The .docx /text path converts through pandoc, and the end-to-end tests
+        # for it skip silently without the binary — a green run that proved nothing.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
+          pandoc --version | head -1
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -36,7 +44,7 @@ jobs:
         env:
           OPENAI_API_KEY: test_key
         run: |
-          pytest --maxfail=1 --disable-warnings --junitxml=test-results-unit.xml
+          pytest -ra --maxfail=1 --disable-warnings --junitxml=test-results-unit.xml
 
       - name: Run integration tests (pgvector container)
         env:

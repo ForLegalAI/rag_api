@@ -2,6 +2,7 @@
 
 import os
 import codecs
+import re
 import tempfile
 
 from typing import Iterator, List, Optional
@@ -18,6 +19,10 @@ from app.config import (
     DOCX_TEXT_USE_PANDOC,
     DOCX_TEXT_TRACK_CHANGES,
     DOCX_TEXT_INCLUDE_HEADERS_FOOTERS,
+    DOCX_TEXT_TABLE_STYLE,
+    DOCX_TEXT_CLEANUP,
+    DOCX_TEXT_STRIP_HEADING_ANCHORS,
+    DOCX_TEXT_DROP_TOC,
     EMAIL_INCLUDE_HEADERS,
     IMAGE_OCR_MAX_PAGES,
 )
@@ -516,6 +521,229 @@ def _combine_headers_and_body(header_block: str, body: str) -> str:
     return header_block or body
 
 
+# ---------------------------------------------------------------------------
+# pandoc Markdown compaction (.docx via the /text endpoint)
+# ---------------------------------------------------------------------------
+
+# A pipe-table row: pandoc writes every cell between unescaped "|" delimiters,
+# escaping any literal pipe in the content as "\|".
+_PIPE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+_PIPE_SPLIT_RE = re.compile(r"(?<!\\)\|")
+_SEPARATOR_CELL_RE = re.compile(r"^:?-+:?$")
+
+# Tracked-change spans with no text: Word records the deletion of a space or of a
+# formatting-only run, and pandoc renders it as ~70 bytes of author/date metadata
+# around nothing. Two such spans in a row are merged by pandoc into one holding a
+# single space, so whitespace-only content counts as empty too. Spans that carry
+# text are left untouched, metadata included.
+_EMPTY_CHANGE_SPAN_RE = re.compile(
+    r"\[[ \t]*\]\{\.(?:insertion|deletion)\b[^}]*\}[ \t]*"
+)
+
+_BLANK_RUN_RE = re.compile(r"\n{3,}")
+
+# A line of a Word-generated table of contents: nothing but links to "_Toc"
+# bookmarks, plus the numbering, dot leaders and page numbers around them. Word
+# reuses the same bookmarks for in-body cross-references ("as set out in [Section
+# 3.2](#_Toc123) below, ..."), so matching the link alone would delete real
+# clauses; a line with prose left over after the links is never a TOC entry.
+_TOC_ENTRY_LINE_RE = re.compile(
+    r"^[\s\d.\-–—]*(?:\[[^\]]*\]\(#_Toc\d+\)[\s\d.\-–—]*)+$"
+)
+
+# Invisible characters Word sprinkles through documents. They inflate token counts
+# and break substring search ("§ 52" typed with a NBSP never matches "§ 52").
+_INVISIBLE_TRANSLATION = {
+    0x00A0: " ",  # no-break space
+    0x2007: " ",  # figure space
+    0x202F: " ",  # narrow no-break space
+    0x00AD: None,  # soft hyphen
+    0x200B: None,  # zero-width space
+    0x200C: None,  # zero-width non-joiner
+    0x200D: None,  # zero-width joiner
+    0xFEFF: None,  # zero-width no-break space / BOM
+}
+
+
+def _pandoc_markdown_format(
+    table_style: str = DOCX_TEXT_TABLE_STYLE,
+    strip_heading_anchors: bool = DOCX_TEXT_STRIP_HEADING_ANCHORS,
+) -> str:
+    """Build the pandoc Markdown writer spec for .docx extraction.
+
+    With grid/multiline/simple tables disabled pandoc writes pipe tables and falls
+    back to an HTML ``<table>`` only for cells holding block content, so no cell is
+    ever padded to the width of the longest line in its column.
+    """
+    fmt = "markdown"
+    if table_style != "grid":
+        fmt += "-grid_tables-multiline_tables-simple_tables"
+    if strip_heading_anchors:
+        fmt += "-header_attributes"
+    return fmt
+
+
+def _split_pipe_row(line: str) -> List[str]:
+    """Split a pipe-table row into its stripped cells (outer delimiters dropped)."""
+    return [cell.strip() for cell in _PIPE_SPLIT_RE.split(line.strip())[1:-1]]
+
+
+def _compact_separator_cell(cell: str) -> str:
+    """Shrink a separator cell to three dashes, keeping its alignment colons."""
+    left = cell.startswith(":")
+    right = cell.endswith(":")
+    return f"{':' if left else ''}---{':' if right else ''}"
+
+
+def _looks_like_rule_row(row: List[str]) -> bool:
+    """True for a "|---|---|" row. ``any(row)``: a row of empty cells is a spacer."""
+    return any(row) and all(_SEPARATOR_CELL_RE.match(cell) for cell in row if cell)
+
+
+def _drop_empty_columns_from_table(rows: List[List[str]]) -> Optional[List[str]]:
+    """Rebuild a pipe table without the columns that are empty in every row.
+
+    Returns ``None`` when nothing can be dropped, so the caller keeps the original
+    lines byte-for-byte.
+    """
+    width = max(len(row) for row in rows)
+    padded = [row + [""] * (width - len(row)) for row in rows]
+
+    # pandoc writes exactly one rule row, directly under the header. Any later row
+    # of dashes is a cell whose content happens to be dashes, and stays verbatim.
+    rule_index = 1 if len(padded) > 1 and _looks_like_rule_row(padded[1]) else None
+
+    body = [row for i, row in enumerate(padded) if i != rule_index]
+    kept = [i for i in range(width) if any(row[i] for row in body)]
+    if len(kept) == width or not kept:
+        return None
+
+    compacted = []
+    for index, row in enumerate(padded):
+        cells = [row[i] for i in kept]
+        if index == rule_index:
+            cells = [_compact_separator_cell(cell or "---") for cell in cells]
+        compacted.append("| " + " | ".join(cells) + " |")
+    return compacted
+
+
+def _drop_empty_table_columns(text: str) -> str:
+    """Remove table columns that hold no content in any row.
+
+    Bilingual contracts routinely carry spare columns (numbering gutters Word never
+    filled), which survive extraction as "| | |" on every row. Only pipe tables are
+    rewritten; the HTML fallback pandoc emits for block-content cells, and anything
+    inside a fenced code block, are left alone.
+    """
+    out: List[str] = []
+    block: List[str] = []
+    in_fence = False
+
+    def flush() -> None:
+        if not block:
+            return
+        if len(block) > 1:
+            compacted = _drop_empty_columns_from_table(
+                [_split_pipe_row(line) for line in block]
+            )
+            out.extend(compacted if compacted is not None else block)
+        else:
+            out.extend(block)
+        block.clear()
+
+    for line in text.split("\n"):
+        # An unterminated fence leaves every later table unpruned rather than
+        # rewritten: the fail-safe direction, since nothing is altered.
+        if line.lstrip().startswith(("```", "~~~")):
+            flush()
+            in_fence = not in_fence
+            out.append(line)
+        elif not in_fence and _PIPE_ROW_RE.match(line):
+            block.append(line)
+        else:
+            flush()
+            out.append(line)
+    flush()
+    return "\n".join(out)
+
+
+def _normalize_invisible_characters(text: str) -> str:
+    return text.translate(_INVISIBLE_TRANSLATION)
+
+
+def _strip_empty_change_spans(text: str) -> str:
+    """Remove tracked-change spans that carry no text.
+
+    The span takes its own trailing whitespace with it, and leaves a single space
+    behind only where it was glued to the preceding word — where a space or a line
+    break already separates, nothing is added. Whitespace elsewhere on the line is
+    never touched, so double spaces in prose, indentation and the contents of code
+    spans survive exactly as pandoc wrote them.
+    """
+
+    def replace(match: "re.Match[str]") -> str:
+        start = match.start()
+        if start == 0 or text[start - 1] in " \t\n":
+            return ""
+        return " "
+
+    return _EMPTY_CHANGE_SPAN_RE.sub(replace, text)
+
+
+def _drop_toc_entries(text: str) -> str:
+    """Drop the lines of a Word-generated table of contents.
+
+    Only lines that consist entirely of "_Toc" bookmark links (with their
+    numbering and page numbers) are dropped: a sentence that merely cross-refers
+    to a heading is body text and stays.
+    """
+    return "\n".join(
+        line for line in text.split("\n") if not _TOC_ENTRY_LINE_RE.match(line)
+    )
+
+
+def _clean_pandoc_markdown(text: str, drop_toc: bool = DOCX_TEXT_DROP_TOC) -> str:
+    """Strip extraction noise that carries no document content.
+
+    Drops all-empty table columns, empty tracked-change spans, invisible characters
+    and runs of blank lines (Word spacer paragraphs). Content, tracked changes that
+    carry text, and comments are preserved.
+    """
+    # Order matters: a cell holding nothing but a zero-width space or a change
+    # span's metadata is an empty cell, and both have to be gone before the column
+    # pass decides which columns are empty.
+    text = _normalize_invisible_characters(text)
+    text = _strip_empty_change_spans(text)
+    text = _drop_empty_table_columns(text)
+    if drop_toc:
+        text = _drop_toc_entries(text)
+    text = "\n".join(line.rstrip() for line in text.split("\n"))
+    return _BLANK_RUN_RE.sub("\n\n", text).strip("\n")
+
+
+# A header/footer holding nothing but a page number ("4", "Page 4 of 10",
+# "Strana 4/10"). It survives extraction as a "[Footer] 4" line that says nothing
+# about the document, so it is skipped.
+# Only the decoration a page number is actually written with. Deliberately excludes
+# "§" and brackets, so a running header of "§ 3" or "(5)" — an article indicator, not
+# a page number — survives.
+_PAGE_DECORATION = r"[\s.\-–—_]*"
+_PAGE_NUMBER_ONLY_RE = re.compile(
+    r"^" + _PAGE_DECORATION + r"(?:"
+    # "Page 4", "Strana 4/10" — the word makes the intent explicit.
+    r"(?:page|pg\.?|strana|str\.?|seite|s\.)\s*\d{1,4}(?:\s*(?:/|of|z|von|aus)\s*\d{1,4})?"
+    # A bare "4" or "- 12 -". Capped at three digits so a numeric matter number
+    # in a footer is not mistaken for a page number.
+    r"|\d{1,3}(?:\s*(?:/|of|z|von|aus)\s*\d{1,3})?)" + _PAGE_DECORATION + r"$",
+    re.IGNORECASE,
+)
+
+
+def _is_page_number_only(text: str) -> bool:
+    """True for header/footer text that is just a page number."""
+    return bool(_PAGE_NUMBER_ONLY_RE.match(text))
+
+
 def _extract_docx_headers_footers(filepath: str) -> str:
     """Extract distinct header/footer text from a .docx via python-docx.
 
@@ -550,9 +778,10 @@ def _extract_docx_headers_footers(filepath: str) -> str:
         )
         for hf, label in parts:
             text = "\n".join(p.text for p in hf.paragraphs).strip()
-            if text and text not in seen:
-                seen.add(text)
-                lines.append(f"[{label}] {text}")
+            if not text or _is_page_number_only(text) or text in seen:
+                continue
+            seen.add(text)
+            lines.append(f"[{label}] {text}")
     return "\n".join(lines)
 
 
@@ -568,6 +797,11 @@ class PandocDocxLoader:
 
     When ``include_headers_footers`` is enabled, header/footer text (which pandoc
     drops) is extracted separately via python-docx and prepended to the body.
+
+    ``table_style`` selects between compact pipe tables (default) and pandoc's
+    padded grid tables; ``cleanup`` runs :func:`_clean_pandoc_markdown` over the
+    result. Both exist because a bilingual contract laid out as one long table used
+    to extract at several times its content size, the surplus being cell padding.
     """
 
     def __init__(
@@ -575,10 +809,18 @@ class PandocDocxLoader:
         filepath: str,
         track_changes: str = DOCX_TEXT_TRACK_CHANGES,
         include_headers_footers: bool = DOCX_TEXT_INCLUDE_HEADERS_FOOTERS,
+        table_style: str = DOCX_TEXT_TABLE_STYLE,
+        cleanup: bool = DOCX_TEXT_CLEANUP,
+        strip_heading_anchors: bool = DOCX_TEXT_STRIP_HEADING_ANCHORS,
+        drop_toc: bool = DOCX_TEXT_DROP_TOC,
     ):
         self.filepath = filepath
         self.track_changes = track_changes
         self.include_headers_footers = include_headers_footers
+        self.table_style = table_style
+        self.cleanup = cleanup
+        self.strip_heading_anchors = strip_heading_anchors
+        self.drop_toc = drop_toc
         self._temp_filepath = None  # For compatibility with cleanup function
 
     def load(self) -> List[Document]:
@@ -594,10 +836,30 @@ class PandocDocxLoader:
         # route can surface ERROR_MESSAGES.PANDOC_NOT_INSTALLED.
         text = pypandoc.convert_file(
             self.filepath,
-            to="markdown",
+            to=_pandoc_markdown_format(self.table_style, self.strip_heading_anchors),
             format="docx",
             extra_args=[f"--track-changes={self.track_changes}", "--wrap=none"],
         )
+
+        if self.cleanup:
+            raw_length = len(text)
+            try:
+                text = _clean_pandoc_markdown(text, drop_toc=self.drop_toc)
+            except Exception as e:
+                # Cleanup only removes noise, so a bug in it must not cost the
+                # caller an extraction pandoc already completed successfully.
+                logger.warning(
+                    "docx text cleanup failed, returning uncleaned text: %s", e
+                )
+            else:
+                # No filename: the upload path carries the client's own file name,
+                # and in this deployment that names matters and parties. Every
+                # other INFO line in this service logs an opaque id instead.
+                logger.info(
+                    "docx text extraction | Chars: %d -> %d after cleanup",
+                    raw_length,
+                    len(text),
+                )
 
         if self.include_headers_footers:
             header_block = _extract_docx_headers_footers(self.filepath)
