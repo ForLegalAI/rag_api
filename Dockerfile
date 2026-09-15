@@ -13,13 +13,14 @@ RUN apt-get update \
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+ENV NLTK_DATA=/app/nltk_data
 
 # Download standard NLTK data, to prevent unstructured from downloading packages at runtime.
-# Use the Python API with explicit package IDs (rather than `python -m nltk.downloader`),
-# which never falls back to the interactive prompt that EOFs during a non-interactive
-# build; unknown IDs are tolerated so the build stays version-agnostic across nltk releases.
-RUN python -c "import nltk; [nltk.download(p, download_dir='/app/nltk_data') for p in ['punkt_tab', 'averaged_perceptron_tagger', 'averaged_perceptron_tagger_eng']]"
-ENV NLTK_DATA=/app/nltk_data
+# Uses the Python API with explicit package IDs (rather than `python -m nltk.downloader`),
+# which never falls back to the interactive prompt that EOFs during a non-interactive build.
+# A failed download now fails the build (upstream #315) instead of leaving the image to
+# fetch at runtime.
+RUN python -c "import nltk, sys; packages = ('punkt_tab', 'averaged_perceptron_tagger', 'averaged_perceptron_tagger_eng'); sys.exit(0 if all(nltk.download(package, download_dir='/app/nltk_data') for package in packages) else 1)"
 
 # Disable Unstructured analytics
 ENV SCARF_NO_ANALYTICS=true
