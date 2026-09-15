@@ -536,11 +536,9 @@ _SEPARATOR_CELL_RE = re.compile(r"^:?-+:?$")
 # around nothing. Two such spans in a row are merged by pandoc into one holding a
 # single space, so whitespace-only content counts as empty too. Spans that carry
 # text are left untouched, metadata included.
-_EMPTY_CHANGE_SPAN_RE = re.compile(r"\[[ \t]*\]\{\.(?:insertion|deletion)\b[^}]*\}")
-
-# Two or more spaces left mid-line where a span was removed. Anchored on a
-# non-space so indentation is never touched.
-_REPEATED_SPACES_RE = re.compile(r"(?<=\S)[ \t]{2,}")
+_EMPTY_CHANGE_SPAN_RE = re.compile(
+    r"\[[ \t]*\]\{\.(?:insertion|deletion)\b[^}]*\}[ \t]*"
+)
 
 _BLANK_RUN_RE = re.compile(r"\n{3,}")
 
@@ -672,19 +670,22 @@ def _normalize_invisible_characters(text: str) -> str:
 
 
 def _strip_empty_change_spans(text: str) -> str:
-    """Remove tracked-change spans that carry no text, line by line.
+    """Remove tracked-change spans that carry no text.
 
-    The span becomes a space (the whitespace Word recorded as deleted), and only
-    the lines actually touched have their doubled spaces collapsed, so markdown
-    indentation elsewhere is left exactly as pandoc wrote it.
+    The span takes its own trailing whitespace with it, and leaves a single space
+    behind only where it was glued to the preceding word — where a space or a line
+    break already separates, nothing is added. Whitespace elsewhere on the line is
+    never touched, so double spaces in prose, indentation and the contents of code
+    spans survive exactly as pandoc wrote them.
     """
-    lines = []
-    for line in text.split("\n"):
-        stripped = _EMPTY_CHANGE_SPAN_RE.sub(" ", line)
-        if stripped != line:
-            stripped = _REPEATED_SPACES_RE.sub(" ", stripped)
-        lines.append(stripped)
-    return "\n".join(lines)
+
+    def replace(match: "re.Match[str]") -> str:
+        start = match.start()
+        if start == 0 or text[start - 1] in " \t\n":
+            return ""
+        return " "
+
+    return _EMPTY_CHANGE_SPAN_RE.sub(replace, text)
 
 
 def _drop_toc_entries(text: str) -> str:
@@ -706,13 +707,14 @@ def _clean_pandoc_markdown(text: str, drop_toc: bool = DOCX_TEXT_DROP_TOC) -> st
     and runs of blank lines (Word spacer paragraphs). Content, tracked changes that
     carry text, and comments are preserved.
     """
-    # Empty change spans go first: a column holding nothing but that metadata is
-    # an empty column, and must be seen as one by the column pass below.
+    # Order matters: a cell holding nothing but a zero-width space or a change
+    # span's metadata is an empty cell, and both have to be gone before the column
+    # pass decides which columns are empty.
+    text = _normalize_invisible_characters(text)
     text = _strip_empty_change_spans(text)
     text = _drop_empty_table_columns(text)
     if drop_toc:
         text = _drop_toc_entries(text)
-    text = _normalize_invisible_characters(text)
     text = "\n".join(line.rstrip() for line in text.split("\n"))
     return _BLANK_RUN_RE.sub("\n\n", text).strip("\n")
 
@@ -839,13 +841,23 @@ class PandocDocxLoader:
 
         if self.cleanup:
             raw_length = len(text)
-            text = _clean_pandoc_markdown(text, drop_toc=self.drop_toc)
-            logger.info(
-                "docx text extraction | File: %s | Chars: %d -> %d after cleanup",
-                self.filepath,
-                raw_length,
-                len(text),
-            )
+            try:
+                text = _clean_pandoc_markdown(text, drop_toc=self.drop_toc)
+            except Exception as e:
+                # Cleanup only removes noise, so a bug in it must not cost the
+                # caller an extraction pandoc already completed successfully.
+                logger.warning(
+                    "docx text cleanup failed, returning uncleaned text: %s", e
+                )
+            else:
+                # No filename: the upload path carries the client's own file name,
+                # and in this deployment that names matters and parties. Every
+                # other INFO line in this service logs an opaque id instead.
+                logger.info(
+                    "docx text extraction | Chars: %d -> %d after cleanup",
+                    raw_length,
+                    len(text),
+                )
 
         if self.include_headers_footers:
             header_block = _extract_docx_headers_footers(self.filepath)

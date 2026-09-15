@@ -245,7 +245,21 @@ DOCX_TEXT_INCLUDE_HEADERS_FOOTERS = (
 #       its content size; kept as an escape hatch. Reproducing the pre-fix output
 #       byte for byte also needs DOCX_TEXT_CLEANUP=False and
 #       DOCX_TEXT_STRIP_HEADING_ANCHORS=False, which are independent of this.
-DOCX_TEXT_TABLE_STYLE = get_env_variable("DOCX_TEXT_TABLE_STYLE", "compact").lower()
+# Unrecognised values fall back to "compact" with a warning rather than failing
+# boot: this knob is cosmetic, unlike VECTOR_DB_TYPE. The warning matters because
+# "grid" is the escape hatch — a typo or a stray space in an .env file would
+# otherwise silently leave the caller on the very behaviour they opted out of.
+DOCX_TEXT_TABLE_STYLES = ("compact", "grid")
+DOCX_TEXT_TABLE_STYLE = (
+    get_env_variable("DOCX_TEXT_TABLE_STYLE", "compact").strip().lower()
+)
+if DOCX_TEXT_TABLE_STYLE not in DOCX_TEXT_TABLE_STYLES:
+    logger.warning(
+        "Unrecognised DOCX_TEXT_TABLE_STYLE %r; expected one of %s. Using 'compact'.",
+        DOCX_TEXT_TABLE_STYLE,
+        ", ".join(DOCX_TEXT_TABLE_STYLES),
+    )
+    DOCX_TEXT_TABLE_STYLE = "compact"
 
 # Post-process the pandoc Markdown to remove noise that carries no content:
 # table columns that are empty in every row, empty tracked-change spans (a deleted

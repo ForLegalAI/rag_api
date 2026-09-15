@@ -799,6 +799,67 @@ def test_clean_pandoc_markdown_strips_merged_empty_change_spans():
     assert _clean_pandoc_markdown(text) == "g) a f)"
 
 
+def test_cleanup_failure_falls_back_to_uncleaned_text(tmp_path):
+    """A bug in cleanup must not cost the caller an extraction pandoc completed."""
+    from app.utils import document_loader
+    from app.utils.document_loader import PandocDocxLoader
+
+    p = tmp_path / "doc.docx"
+    p.write_bytes(b"placeholder")
+
+    fake_pypandoc = MagicMock()
+    fake_pypandoc.convert_file.return_value = "| a | b |\n|---|---|\n"
+
+    loader = PandocDocxLoader(str(p), include_headers_footers=False)
+    with patch.dict("sys.modules", {"pypandoc": fake_pypandoc}), patch.object(
+        document_loader, "_clean_pandoc_markdown", side_effect=RuntimeError("boom")
+    ):
+        docs = loader.load()
+
+    assert docs[0].page_content == "| a | b |\n|---|---|\n"
+
+
+def test_extraction_log_line_omits_the_file_path(tmp_path, caplog):
+    """Upload paths carry the client's filename, which names matters and parties."""
+    import logging
+
+    from app.utils.document_loader import PandocDocxLoader
+
+    p = tmp_path / "Smith_v_Jones_Settlement.docx"
+    p.write_bytes(b"placeholder")
+
+    fake_pypandoc = MagicMock()
+    fake_pypandoc.convert_file.return_value = "Body."
+
+    loader = PandocDocxLoader(str(p), include_headers_footers=False)
+    with caplog.at_level(logging.INFO), patch.dict(
+        "sys.modules", {"pypandoc": fake_pypandoc}
+    ):
+        loader.load()
+
+    assert any("Chars:" in record.message for record in caplog.records)
+    assert not any("Smith_v_Jones" in record.getMessage() for record in caplog.records)
+
+
+def test_clean_pandoc_markdown_leaves_double_spaces_elsewhere_on_the_line():
+    """Removing a noise span must not reflow whitespace that is document content."""
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    text = 'Use `a  b` here []{.deletion author="A" date="D"}and "quoted  text".'
+    assert _clean_pandoc_markdown(text) == 'Use `a  b` here and "quoted  text".'
+
+
+def test_cleanup_drops_column_holding_only_invisible_characters():
+    """A cell of nothing but a zero-width space is an empty cell."""
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    table = "| Term | Meaning | \u200b |\n|---|---|---|\n| Employer | the company | \u200b |\n"
+    out = _clean_pandoc_markdown(table)
+
+    for line in out.strip().split("\n"):
+        assert line.count("|") == 3, line
+
+
 def test_grid_style_alone_still_strips_heading_anchors():
     """The two knobs are independent: restoring the old output verbatim needs both."""
     from app.utils.document_loader import _pandoc_markdown_format
