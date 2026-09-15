@@ -268,6 +268,16 @@ if DOCX_TEXT_TABLE_STYLE not in DOCX_TEXT_TABLE_STYLES:
 # carry text keep their author and date untouched.
 DOCX_TEXT_CLEANUP = get_env_variable("DOCX_TEXT_CLEANUP", "True").lower() == "true"
 
+# Grid tables encode their columns as character positions, so any cleanup that
+# shortens a row leaves its "|" delimiters no longer under the "+---+" rule. The
+# two settings are independent by design, and someone reaching for the grid escape
+# hatch keeps cleanup's default "True" without meaning to, so say so once at boot.
+if DOCX_TEXT_TABLE_STYLE == "grid" and DOCX_TEXT_CLEANUP:
+    logger.warning(
+        "DOCX_TEXT_TABLE_STYLE=grid with DOCX_TEXT_CLEANUP=True: cleanup can shift "
+        "a grid table's column boundaries. Set DOCX_TEXT_CLEANUP=False alongside it."
+    )
+
 # Drop the heading anchors pandoc derives from Word bookmarks ("# Heading
 # {#_Toc123456789}"). These are Word-internal TOC/cross-reference ids, not content.
 DOCX_TEXT_STRIP_HEADING_ANCHORS = (

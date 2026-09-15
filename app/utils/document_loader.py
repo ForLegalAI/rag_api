@@ -652,6 +652,8 @@ def _drop_empty_table_columns(text: str) -> str:
         block.clear()
 
     for line in text.split("\n"):
+        # An unterminated fence leaves every later table unpruned rather than
+        # rewritten: the fail-safe direction, since nothing is altered.
         if line.lstrip().startswith(("```", "~~~")):
             flush()
             in_fence = not in_fence
