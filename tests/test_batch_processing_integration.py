@@ -49,7 +49,11 @@ class TestMemoryOptimization:
         # Process with batch size of 10
         with patch("app.routes.document_routes.EMBEDDING_BATCH_SIZE", 10):
             result = await _process_documents_async_pipeline(
-                documents=docs, file_id="test", vector_store=mock_store, executor=None
+                documents=docs,
+                file_id="test",
+                user_id="testuser",
+                vector_store=mock_store,
+                executor=None,
             )
 
         # Verify we got all 100 IDs back
@@ -88,7 +92,11 @@ class TestMemoryOptimization:
 
         with patch("app.routes.document_routes.EMBEDDING_BATCH_SIZE", 5):
             await _process_documents_async_pipeline(
-                documents=docs, file_id="test", vector_store=mock_store, executor=None
+                documents=docs,
+                file_id="test",
+                user_id="testuser",
+                vector_store=mock_store,
+                executor=None,
             )
 
         current, peak = tracemalloc.get_traced_memory()
@@ -123,7 +131,11 @@ class TestMemoryOptimization:
 
         with patch("app.routes.document_routes.EMBEDDING_BATCH_SIZE", 5):
             result = await _process_documents_async_pipeline(
-                documents=docs, file_id="test", vector_store=mock_store, executor=None
+                documents=docs,
+                file_id="test",
+                user_id="testuser",
+                vector_store=mock_store,
+                executor=None,
             )
 
         # Verify batches were processed in order
@@ -163,6 +175,7 @@ class TestSyncBatchedMemory:
                 result = await _process_documents_batched_sync(
                     documents=docs,
                     file_id="test",
+                    user_id="testuser",
                     vector_store=mock_store,
                     executor=executor,
                 )
@@ -194,6 +207,7 @@ class TestBatchProcessingResilience:
         mock_store = AsyncMock()
         mock_store.aadd_documents = failing_add_documents
         mock_store.delete = AsyncMock()
+        mock_store.delete_by_metadata = AsyncMock()
 
         docs = [
             Document(page_content=f"doc_{i}", metadata={"idx": i}) for i in range(15)
@@ -204,19 +218,21 @@ class TestBatchProcessingResilience:
                 await _process_documents_async_pipeline(
                     documents=docs,
                     file_id="test_file",
+                    user_id="testuser",
                     vector_store=mock_store,
                     executor=None,
                 )
 
         # Verify rollback was called because we had inserted batches
-        mock_store.delete.assert_called_once()
+        mock_store.delete.assert_not_called()
+        mock_store.delete_by_metadata.assert_called_once()
 
         # Verify we inserted 2 batches before failure
         assert len(inserted_batches) == 2
 
     @pytest.mark.asyncio
-    async def test_rollback_called_with_correct_file_id(self):
-        """Test that rollback uses the correct file_id."""
+    async def test_rollback_called_with_current_ingestion_attempt(self):
+        """Test that rollback targets only the current ingestion attempt."""
         from app.routes.document_routes import _process_documents_async_pipeline
 
         async def failing_on_second(docs, ids=None, executor=None):
@@ -227,6 +243,7 @@ class TestBatchProcessingResilience:
         mock_store = AsyncMock()
         mock_store.aadd_documents = failing_on_second
         mock_store.delete = AsyncMock()
+        mock_store.delete_by_metadata = AsyncMock()
 
         docs = [
             Document(page_content=f"doc_{i}", metadata={"idx": i}) for i in range(10)
@@ -237,14 +254,24 @@ class TestBatchProcessingResilience:
                 await _process_documents_async_pipeline(
                     documents=docs,
                     file_id="my_unique_file_id",
+                    user_id="testuser",
                     vector_store=mock_store,
                     executor=None,
                 )
 
-        # Verify delete was called with the correct file_id
-        mock_store.delete.assert_called_once()
-        call_kwargs = mock_store.delete.call_args
-        assert call_kwargs[1]["ids"] == ["my_unique_file_id"]
+        mock_store.delete.assert_not_called()
+        mock_store.delete_by_metadata.assert_called_once()
+        metadata_filter = mock_store.delete_by_metadata.call_args.args[0]
+        assert metadata_filter["file_id"] == "my_unique_file_id"
+        attempt_id = metadata_filter["_rag_ingestion_attempt_id"]
+        assert attempt_id
+        assert all(
+            document.metadata["file_id"] == "my_unique_file_id" for document in docs
+        )
+        assert all(
+            document.metadata["_rag_ingestion_attempt_id"] == attempt_id
+            for document in docs
+        )
 
 
 class TestConfigurationBehavior:
@@ -274,6 +301,25 @@ class TestConfigurationBehavior:
         # When batch size is 0, aadd_documents should be called directly
         # (not through the pipeline)
         assert mock_store.aadd_documents.called
+        stored_documents = mock_store.aadd_documents.call_args.args[0]
+        assert [
+            document.metadata["_rag_chunk_index"] for document in stored_documents
+        ] == list(range(len(stored_documents)))
+        assert all(
+            document.metadata["file_id"] == "test_file" for document in stored_documents
+        )
+        attempt_ids = {
+            document.metadata["_rag_ingestion_attempt_id"]
+            for document in stored_documents
+        }
+        started_at_values = {
+            document.metadata["_rag_ingestion_attempt_started_at_ns"]
+            for document in stored_documents
+        }
+        assert len(attempt_ids) == 1
+        assert all(attempt_ids)
+        assert len(started_at_values) == 1
+        assert type(next(iter(started_at_values))) is int
 
     @pytest.mark.asyncio
     async def test_different_batch_sizes_produce_correct_batches(self):
@@ -300,6 +346,7 @@ class TestConfigurationBehavior:
                 await _process_documents_async_pipeline(
                     documents=docs,
                     file_id="test",
+                    user_id="testuser",
                     vector_store=mock_store,
                     executor=None,
                 )

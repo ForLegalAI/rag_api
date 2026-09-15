@@ -26,6 +26,95 @@ The API will evolve over time to employ different querying/re-ranking methods, e
 - **Vector Store**: Utilizes Langchain's vector store for efficient document retrieval.
 - **Asynchronous Support**: Offers async operations for enhanced performance.
 
+## Retrieval scope
+
+Chunks are owned. Every route that reads or removes stored content resolves the
+caller's owner set from the verified token and puts it into the store query
+*before* ranking, so a chunk outside that set is never read into the process.
+The owner set is built in one place — `app/scope.py` — rather than re-derived per
+route.
+
+Before this release these routes addressed the store by caller-supplied
+`file_id` alone, or authorized a whole result set from the first hit returned:
+
+- `GET /ids` listed every file id in the deployment.
+- `POST /query_multiple` performed no authorization at all, so pairing it with
+  `GET /ids` disclosed the content of every file to any authenticated caller.
+- `POST /query` authorized the whole result set from `documents[0]`, so any hit
+  behind the first was never checked. A `file_id` is chosen by whoever uploads,
+  so an attacker's own row ranking first authorized the rows behind it.
+- `GET /documents`, `GET /documents/{id}/context` and `DELETE /documents` read or
+  deleted the chunks of any file id the caller could name.
+- A chunk with no recorded `user_id` read as "belongs to everyone".
+- On the synchronous store path, a failed ingestion rolled back by `file_id`
+  alone, so an upload under someone else's file id destroyed their chunks. The
+  async pgvector pipeline already scopes its rollback to the ingestion attempt.
+
+**What changes for callers.** A caller reads and deletes only what it owns. A
+file id outside the caller's scope answers "not found" rather than "found but
+refused", so none of these routes is an existence oracle. Chunks with no
+`user_id` are owned by nobody and are no longer readable — if a deployment holds
+such rows and still needs them, stamp an owner on them before upgrading:
+
+```sql
+UPDATE langchain_pg_embedding
+SET cmetadata = jsonb_set(cmetadata, '{user_id}', '"<owner>"')
+WHERE cmetadata->>'user_id' IS NULL;
+```
+
+**If this deployment ever ran without `JWT_SECRET`, check for `public` too.** With
+no signing key configured there is no caller identity to record, so every chunk
+written in that period is owned by the literal string `public`. Once a signing
+key is set, callers arrive with their own ids and none of them owns `public`, so
+that content stops being readable. Routes other than `/query` returned it to
+everybody before this release, which is exactly the hole being closed — but if
+the content is still wanted, give it a real owner first:
+
+```sql
+-- inspect before rewriting: this is content nobody was ever identified as owning
+SELECT count(*) FROM langchain_pg_embedding WHERE cmetadata->>'user_id' = 'public';
+```
+
+Deployments that never set `JWT_SECRET` are unaffected: with no key configured
+the read scope is `public` as well, so what was written is what is read.
+
+`atlas-mongo` deployments must add `user_id` to the vector search index first;
+see [Use Atlas MongoDB as Vector Database](#use-atlas-mongodb-as-vector-database).
+
+**Deleting entity-owned files requires `entity_id`.** Chunks embedded under an
+`entity_id` — an agent knowledge base, for instance — are owned by that entity
+rather than by the uploading user, so `DELETE /documents` needs the same
+`entity_id` that the upload used, as a query parameter alongside the JSON body of
+file ids. A delete that omits it resolves to the caller's own scope, matches
+nothing, and answers 404 with the chunks left in place. Because a 404 is
+indistinguishable from "already deleted", a caller that treats it as success will
+orphan those chunks silently.
+
+**Upgrade the client first.** Deploy order matters, in one direction only:
+
+- A client that sends `entity_id` against an *older* build is inert — the
+  parameter is simply undeclared there, so the request behaves exactly as before.
+- An *older* client against this build orphans every agent knowledge-base file it
+  tries to delete.
+
+So upgrade the client first, or both together — never this service first.
+LibreChat carries the matching change: it records the owner each embed was made
+under and sends it on delete, with `npm run migrate:embed-owners` to backfill
+files embedded before that.
+
+**`entity_id` is unchanged and still caller-asserted.** Agent knowledge bases are
+owned by an agent id rather than a user id, so a caller reading one names it via
+`entity_id`. That id now *widens* the owner set rather than replacing the
+caller's identity — the caller's own scope always remains — but nothing in a
+token minted today proves the caller may act for the entity it names. A caller
+that knows another owner's id can still name it — on read, to reach that owner's
+chunks, and on the ingestion routes, where `entity_id` is what gets stamped as the
+owner, to write into that owner's namespace. Deployments exposing this API to
+untrusted callers must continue to authorize entity access upstream. Closing this
+requires the token to carry the entity authorization, which is a coordinated
+change with the callers that mint those tokens and is tracked separately from
+this release.
+
 ## Setup
 
 ### Getting Started
@@ -93,6 +182,9 @@ The following environment variables are required to run the application:
 - `PG_POOL_PRE_PING`: (Optional) Set to "False" to disable SQLAlchemy's pre-ping check. Default is "True". When enabled, the connection pool issues a lightweight `SELECT 1` before handing out a pooled connection, so stale connections dropped by a remote server or middlebox idle timeout are transparently replaced instead of surfacing as query errors. Recommended for any deployment that connects to a remote PostgreSQL instance (managed Postgres, connections that traverse a load balancer, etc.).
 - `PG_POOL_RECYCLE`: (Optional) Maximum age in seconds of a pooled connection before it is recycled. Default is "-1" (disabled). Set to a positive value when the server enforces a hard idle or max-lifetime limit (e.g. "1800" for a 30-minute cap).
 - `POSTGRES_SCHEMA`: (Optional) Prepend this schema to the Postgres `search_path` so langchain's pgvector tables live in (and are read from) it. Unset by default (uses the user's default schema, typically `public`). Useful when sharing a database with other services — create the schema out-of-band first (`CREATE SCHEMA IF NOT EXISTS <name>; GRANT USAGE, CREATE ON SCHEMA <name> TO <app_user>;`); the RAG API will not create it for you and fails fast at startup if the schema is missing. `public` is always appended to the resulting search path so the `vector` data type stays resolvable when the extension was installed there (the common case). Multiple schemas may be supplied as a comma-separated list (e.g. `myapp,extensions`) when the `vector` extension lives in a non-`public` schema.
+- `PGVECTOR_CREATE_LEGACY_INDEXES`: (Optional) Set to "True" to create the legacy `custom_id` and `cmetadata->>'file_id'` indexes on startup. Default is "False".
+- `PGVECTOR_MIGRATE_CMETADATA_JSONB`: (Optional) Set to "True" to migrate `langchain_pg_embedding.cmetadata` from JSON to JSONB on startup. Default is "False".
+- `PGVECTOR_CREATE_CMETADATA_GIN_INDEX`: (Optional) Set to "True" to create the `cmetadata` JSONB GIN index on startup. Default is "False". The index is created only when `cmetadata` is already JSONB; for a legacy JSON column, also enable `PGVECTOR_MIGRATE_CMETADATA_JSONB` or the index step is skipped.
 - `RAG_HOST`: (Optional) The hostname or IP address where the API server will run. Defaults to "0.0.0.0"
 - `RAG_PORT`: (Optional) The port number where the API server will run. Defaults to port 8000.
 - `JWT_SECRET`: (Optional) The secret key used for verifying JWT tokens for requests.
@@ -102,8 +194,9 @@ The following environment variables are required to run the application:
 - `COLLECTION_NAME`: (Optional) The name of the collection in the vector store. Default value is "testcollection".
 - `CHUNK_SIZE`: (Optional) The size of the chunks for text processing. Default value is "1500".
 - `CHUNK_OVERLAP`: (Optional) The overlap between chunks during text processing. Default value is "100".
-- `EMBEDDING_BATCH_SIZE`: (Optional) Number of document chunks to process per batch. Set to `0` (default) to disable batching. Recommended value is `750` for `text-embedding-3-small`.
+- `EMBEDDING_BATCH_SIZE`: (Optional) Number of document chunks to process per batch. Defaults to `500`; set to `0` to disable batching. Recommended value is `750` for `text-embedding-3-small`.
 - `EMBEDDING_MAX_QUEUE_SIZE`: (Optional) Maximum number of batches to buffer in memory during async processing. Default value is "3".
+- `PARALLEL_EXECUTION`: (Optional) Maximum number of async embedding/database insertion consumers to run per file when batching is enabled. Default value is "2".
 - `RAG_DISTANCE_THRESHOLD`: (Optional, `VECTOR_DB_TYPE=pgvector` only) Drop results whose vector distance is greater than this value, after the top-`k` search. Unset by default (no filtering). Lower distance = more similar, so e.g. `0.5` keeps only hits with distance ≤ 0.5 and discards weaker matches. Useful for reducing downstream LLM token cost when the top-`k` call returns loosely-related chunks. Appropriate values depend on the embedding model and distance strategy — inspect your actual scores before choosing one. Ignored (with a startup warning) under `VECTOR_DB_TYPE=atlas-mongo`, because Atlas returns a similarity score (higher = better) with inverted semantics.
 - `RAG_UPLOAD_DIR`: (Optional) The directory where uploaded files are stored. Default value is "./uploads/".
 - `DOCX_TEXT_USE_PANDOC`: (Optional) Boolean. When "True" (default), `.docx` files sent to the `/text` endpoint are converted via **pandoc** so tracked changes and comments are preserved (output is Markdown). The embedding path always uses `Docx2txtLoader`. Pandoc only reads OOXML `.docx`; legacy binary `.doc` files are rejected with an error asking you to convert to `.docx`. Requires the `pandoc` binary (already installed in the provided Docker images).
@@ -164,8 +257,9 @@ For large files, you can enable batched embedding processing to reduce memory co
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EMBEDDING_BATCH_SIZE` | `0` | Number of document chunks to process per batch. `0` disables batching (original behavior). |
+| `EMBEDDING_BATCH_SIZE` | `500` | Number of document chunks to process per batch. `0` disables batching (original behavior). |
 | `EMBEDDING_MAX_QUEUE_SIZE` | `3` | Maximum number of batches to buffer in memory during async processing. |
+| `PARALLEL_EXECUTION` | `2` | Maximum number of async embedding/database insertion consumers per file when batching is enabled. |
 
 #### Recommended Settings
 
@@ -178,16 +272,19 @@ For memory-constrained environments (< 2GB RAM):
 For high-throughput environments:
 - `EMBEDDING_BATCH_SIZE=1000-2000`
 - `EMBEDDING_MAX_QUEUE_SIZE=5`
+- Increase `PARALLEL_EXECUTION` cautiously; it applies per active file upload.
 
 #### Behavior
 
 When `EMBEDDING_BATCH_SIZE > 0`:
 - Documents are processed in batches of the specified size
-- Each batch is embedded and inserted before the next batch starts
-- On failure, successfully inserted documents are rolled back
-- Memory usage is bounded by `EMBEDDING_BATCH_SIZE * EMBEDDING_MAX_QUEUE_SIZE`
+- Up to `PARALLEL_EXECUTION` batches for the same file can be embedded and inserted concurrently
+- `PARALLEL_EXECUTION` is per request/file. Total process concurrency can be roughly `active uploads * PARALLEL_EXECUTION`, bounded indirectly by `RAG_THREAD_POOL_SIZE` and downstream provider/database limits
+- On failure, remaining batch work is stopped and successfully inserted documents are rolled back
+- Memory usage is bounded by queued plus active batches, roughly `EMBEDDING_BATCH_SIZE * (EMBEDDING_MAX_QUEUE_SIZE + PARALLEL_EXECUTION)`
+- Ingestion lifecycle logs include route, user, file, chunk count, file size, elapsed time, and selected process memory context. Per-batch queue/insert progress is logged at debug level
 
-When `EMBEDDING_BATCH_SIZE = 0` (default):
+When `EMBEDDING_BATCH_SIZE <= 0`:
 - All documents are processed at once (original behavior)
 - Better for small files or memory-rich environments
 
@@ -216,12 +313,22 @@ The `ATLAS_MONGO_DB_URI` could be the same or different from what is used by Lib
     {
       "path": "file_id",
       "type": "filter"
+    },
+    {
+      "path": "user_id",
+      "type": "filter"
     }
   ]
 }
 ```
 
 Follow one of the [four documented methods](https://www.mongodb.com/docs/atlas/atlas-vector-search/create-index/#procedure) to create the vector index.
+
+> **Upgrading an existing Atlas deployment:** `user_id` is a required filter field
+> as of the release described under [Retrieval scope](#retrieval-scope). Retrieval
+> now filters on it, and Atlas Vector Search rejects a `$vectorSearch` pre-filter on
+> a path the index does not declare — so add it to the index definition **before**
+> deploying, or `/query` and `/query_multiple` will start returning errors.
 
 #### Create a `file_id` Index (recommended)
 
