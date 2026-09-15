@@ -709,6 +709,8 @@ def test_pandoc_docx_loader_cleans_output_by_default(tmp_path):
         ("Strana 4/10", True),
         ("Matter No. 12345", False),
         ("12345", False),  # a numeric matter number is not a page number
+        ("§ 3", False),  # an article running header, not a page number
+        ("(5)", False),
         ("PRIVILEGED & CONFIDENTIAL", False),
         ("Article 5", False),
     ],
@@ -729,6 +731,82 @@ def test_extract_docx_headers_footers_skips_page_numbers(tmp_path):
     block = _extract_docx_headers_footers(str(p))
     assert "[Header] PRIVILEGED & CONFIDENTIAL" in block
     assert "[Footer]" not in block
+
+
+def test_drop_toc_keeps_in_body_cross_references():
+    """Word reuses _Toc bookmarks for cross-references; a clause is not a TOC entry."""
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    clause = (
+        "As set out in [Section 3.2 (Termination)](#_Toc123456789) below, the "
+        "Employer may terminate this Agreement immediately."
+    )
+    assert _clean_pandoc_markdown(clause, drop_toc=True) == clause
+
+
+def test_drop_toc_removes_generated_toc_lines():
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    text = (
+        "[Article 1 Definitions](#_Toc1) 3\n"
+        "[Article 2 Term](#_Toc2) 7\n"
+        "\n"
+        "Body text."
+    )
+    assert _clean_pandoc_markdown(text, drop_toc=True) == "Body text."
+
+
+def test_cleanup_drops_column_holding_only_empty_change_spans():
+    """The noise metadata is stripped before columns are judged empty."""
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    table = (
+        '| Term | Meaning | []{.deletion author="A" date="D"} |\n'
+        "|---|---|---|\n"
+        '| Employer | means the company | []{.deletion author="A" date="D"} |\n'
+    )
+    out = _clean_pandoc_markdown(table)
+
+    assert ".deletion" not in out
+    for line in out.strip().split("\n"):
+        assert line.count("|") == 3, line
+
+
+def test_drop_empty_table_columns_keeps_dash_only_data_row():
+    """Only the rule under the header is a rule; later dashes are cell content."""
+    from app.utils.document_loader import _drop_empty_table_columns
+
+    table = "| A | B |  |\n|---|---|--|\n| x | y |  |\n| --- | ---- |  |\n"
+    out = _drop_empty_table_columns(table).strip().split("\n")
+
+    assert out[1] == "| --- | --- |"  # the header rule, compacted
+    assert out[3] == "| --- | ---- |"  # data row, verbatim
+
+
+def test_drop_empty_table_columns_skips_fenced_code_blocks():
+    """Pipe-looking lines inside a code fence are content, not a table."""
+    from app.utils.document_loader import _drop_empty_table_columns
+
+    text = "```\n| id | name |  |\n| 1  | x    |  |\n```\n"
+    assert _drop_empty_table_columns(text) == text
+
+
+def test_clean_pandoc_markdown_strips_merged_empty_change_spans():
+    """Two adjacent empty deletions are merged by pandoc into "[ ]{...}"."""
+    from app.utils.document_loader import _clean_pandoc_markdown
+
+    text = 'g) [ ]{.deletion author="Jaroslav Skubal" date="2026-09-14T17:08:00Z"}a f)'
+    assert _clean_pandoc_markdown(text) == "g) a f)"
+
+
+def test_grid_style_alone_still_strips_heading_anchors():
+    """The two knobs are independent: restoring the old output verbatim needs both."""
+    from app.utils.document_loader import _pandoc_markdown_format
+
+    assert (
+        _pandoc_markdown_format(table_style="grid", strip_heading_anchors=True)
+        == "markdown-header_attributes"
+    )
 
 
 # --- end-to-end, with a real pandoc binary ---------------------------------

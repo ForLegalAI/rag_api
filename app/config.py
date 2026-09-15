@@ -242,8 +242,9 @@ DOCX_TEXT_INCLUDE_HEADERS_FOOTERS = (
 #   "grid": pandoc's default grid/simple tables, which pad every cell of every row
 #       to the width of the longest line in that column. Combined with --wrap=none
 #       a single long clause can blow a bilingual contract table up to many times
-#       its content size; kept as an escape hatch for callers that need the old
-#       output verbatim.
+#       its content size; kept as an escape hatch. Reproducing the pre-fix output
+#       byte for byte also needs DOCX_TEXT_CLEANUP=False and
+#       DOCX_TEXT_STRIP_HEADING_ANCHORS=False, which are independent of this.
 DOCX_TEXT_TABLE_STYLE = get_env_variable("DOCX_TEXT_TABLE_STYLE", "compact").lower()
 
 # Post-process the pandoc Markdown to remove noise that carries no content:

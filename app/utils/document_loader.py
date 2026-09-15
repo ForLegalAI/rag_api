@@ -533,13 +533,25 @@ _SEPARATOR_CELL_RE = re.compile(r"^:?-+:?$")
 
 # Tracked-change spans with no text: Word records the deletion of a space or of a
 # formatting-only run, and pandoc renders it as ~70 bytes of author/date metadata
-# around nothing. Spans that do carry text are left untouched, metadata included.
-_EMPTY_CHANGE_SPAN_RE = re.compile(r"\[\]\{\.(?:insertion|deletion)\b[^}]*\}[ \t]*")
+# around nothing. Two such spans in a row are merged by pandoc into one holding a
+# single space, so whitespace-only content counts as empty too. Spans that carry
+# text are left untouched, metadata included.
+_EMPTY_CHANGE_SPAN_RE = re.compile(r"\[[ \t]*\]\{\.(?:insertion|deletion)\b[^}]*\}")
+
+# Two or more spaces left mid-line where a span was removed. Anchored on a
+# non-space so indentation is never touched.
+_REPEATED_SPACES_RE = re.compile(r"(?<=\S)[ \t]{2,}")
 
 _BLANK_RUN_RE = re.compile(r"\n{3,}")
 
-# An entry of a Word-generated table of contents: a link to a "_Toc" bookmark.
-_TOC_ENTRY_RE = re.compile(r"\]\(#_Toc\d+\)")
+# A line of a Word-generated table of contents: nothing but links to "_Toc"
+# bookmarks, plus the numbering, dot leaders and page numbers around them. Word
+# reuses the same bookmarks for in-body cross-references ("as set out in [Section
+# 3.2](#_Toc123) below, ..."), so matching the link alone would delete real
+# clauses; a line with prose left over after the links is never a TOC entry.
+_TOC_ENTRY_LINE_RE = re.compile(
+    r"^[\s\d.\-–—]*(?:\[[^\]]*\]\(#_Toc\d+\)[\s\d.\-–—]*)+$"
+)
 
 # Invisible characters Word sprinkles through documents. They inflate token counts
 # and break substring search ("§ 52" typed with a NBSP never matches "§ 52").
@@ -585,6 +597,11 @@ def _compact_separator_cell(cell: str) -> str:
     return f"{':' if left else ''}---{':' if right else ''}"
 
 
+def _looks_like_rule_row(row: List[str]) -> bool:
+    """True for a "|---|---|" row. ``any(row)``: a row of empty cells is a spacer."""
+    return any(row) and all(_SEPARATOR_CELL_RE.match(cell) for cell in row if cell)
+
+
 def _drop_empty_columns_from_table(rows: List[List[str]]) -> Optional[List[str]]:
     """Rebuild a pipe table without the columns that are empty in every row.
 
@@ -594,20 +611,19 @@ def _drop_empty_columns_from_table(rows: List[List[str]]) -> Optional[List[str]]
     width = max(len(row) for row in rows)
     padded = [row + [""] * (width - len(row)) for row in rows]
 
-    def is_separator(row: List[str]) -> bool:
-        # any(row): a row of nothing but empty cells is a spacer row, not the
-        # "|---|---|" rule, and must keep its shape.
-        return any(row) and all(_SEPARATOR_CELL_RE.match(cell) for cell in row if cell)
+    # pandoc writes exactly one rule row, directly under the header. Any later row
+    # of dashes is a cell whose content happens to be dashes, and stays verbatim.
+    rule_index = 1 if len(padded) > 1 and _looks_like_rule_row(padded[1]) else None
 
-    body = [row for row in padded if not is_separator(row)]
+    body = [row for i, row in enumerate(padded) if i != rule_index]
     kept = [i for i in range(width) if any(row[i] for row in body)]
     if len(kept) == width or not kept:
         return None
 
     compacted = []
-    for row in padded:
+    for index, row in enumerate(padded):
         cells = [row[i] for i in kept]
-        if is_separator(row):
+        if index == rule_index:
             cells = [_compact_separator_cell(cell or "---") for cell in cells]
         compacted.append("| " + " | ".join(cells) + " |")
     return compacted
@@ -618,10 +634,12 @@ def _drop_empty_table_columns(text: str) -> str:
 
     Bilingual contracts routinely carry spare columns (numbering gutters Word never
     filled), which survive extraction as "| | |" on every row. Only pipe tables are
-    rewritten; the HTML fallback pandoc emits for block-content cells is left alone.
+    rewritten; the HTML fallback pandoc emits for block-content cells, and anything
+    inside a fenced code block, are left alone.
     """
     out: List[str] = []
     block: List[str] = []
+    in_fence = False
 
     def flush() -> None:
         if not block:
@@ -636,7 +654,11 @@ def _drop_empty_table_columns(text: str) -> str:
         block.clear()
 
     for line in text.split("\n"):
-        if _PIPE_ROW_RE.match(line):
+        if line.lstrip().startswith(("```", "~~~")):
+            flush()
+            in_fence = not in_fence
+            out.append(line)
+        elif not in_fence and _PIPE_ROW_RE.match(line):
             block.append(line)
         else:
             flush()
@@ -649,10 +671,31 @@ def _normalize_invisible_characters(text: str) -> str:
     return text.translate(_INVISIBLE_TRANSLATION)
 
 
+def _strip_empty_change_spans(text: str) -> str:
+    """Remove tracked-change spans that carry no text, line by line.
+
+    The span becomes a space (the whitespace Word recorded as deleted), and only
+    the lines actually touched have their doubled spaces collapsed, so markdown
+    indentation elsewhere is left exactly as pandoc wrote it.
+    """
+    lines = []
+    for line in text.split("\n"):
+        stripped = _EMPTY_CHANGE_SPAN_RE.sub(" ", line)
+        if stripped != line:
+            stripped = _REPEATED_SPACES_RE.sub(" ", stripped)
+        lines.append(stripped)
+    return "\n".join(lines)
+
+
 def _drop_toc_entries(text: str) -> str:
-    """Drop the lines of a Word-generated table of contents (links to #_Toc marks)."""
+    """Drop the lines of a Word-generated table of contents.
+
+    Only lines that consist entirely of "_Toc" bookmark links (with their
+    numbering and page numbers) are dropped: a sentence that merely cross-refers
+    to a heading is body text and stays.
+    """
     return "\n".join(
-        line for line in text.split("\n") if not _TOC_ENTRY_RE.search(line)
+        line for line in text.split("\n") if not _TOC_ENTRY_LINE_RE.match(line)
     )
 
 
@@ -663,8 +706,10 @@ def _clean_pandoc_markdown(text: str, drop_toc: bool = DOCX_TEXT_DROP_TOC) -> st
     and runs of blank lines (Word spacer paragraphs). Content, tracked changes that
     carry text, and comments are preserved.
     """
+    # Empty change spans go first: a column holding nothing but that metadata is
+    # an empty column, and must be seen as one by the column pass below.
+    text = _strip_empty_change_spans(text)
     text = _drop_empty_table_columns(text)
-    text = _EMPTY_CHANGE_SPAN_RE.sub("", text)
     if drop_toc:
         text = _drop_toc_entries(text)
     text = _normalize_invisible_characters(text)
@@ -675,13 +720,17 @@ def _clean_pandoc_markdown(text: str, drop_toc: bool = DOCX_TEXT_DROP_TOC) -> st
 # A header/footer holding nothing but a page number ("4", "Page 4 of 10",
 # "Strana 4/10"). It survives extraction as a "[Footer] 4" line that says nothing
 # about the document, so it is skipped.
+# Only the decoration a page number is actually written with. Deliberately excludes
+# "§" and brackets, so a running header of "§ 3" or "(5)" — an article indicator, not
+# a page number — survives.
+_PAGE_DECORATION = r"[\s.\-–—_]*"
 _PAGE_NUMBER_ONLY_RE = re.compile(
-    r"^\W*(?:"
+    r"^" + _PAGE_DECORATION + r"(?:"
     # "Page 4", "Strana 4/10" — the word makes the intent explicit.
     r"(?:page|pg\.?|strana|str\.?|seite|s\.)\s*\d{1,4}(?:\s*(?:/|of|z|von|aus)\s*\d{1,4})?"
     # A bare "4" or "- 12 -". Capped at three digits so a numeric matter number
     # in a footer is not mistaken for a page number.
-    r"|\d{1,3}(?:\s*(?:/|of|z|von|aus)\s*\d{1,3})?)\W*$",
+    r"|\d{1,3}(?:\s*(?:/|of|z|von|aus)\s*\d{1,3})?)" + _PAGE_DECORATION + r"$",
     re.IGNORECASE,
 )
 
