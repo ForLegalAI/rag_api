@@ -2,8 +2,10 @@ FROM python:3.12 AS main
 
 WORKDIR /app
 
-# Install pandoc and netcat
+# Install pandoc and netcat. `upgrade` pulls Debian security fixes (e.g.
+# perl-base) that the base image tag may not carry yet.
 RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends \
     pandoc \
     netcat-openbsd \

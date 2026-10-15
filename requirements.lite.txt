@@ -11,6 +11,8 @@ pgvector==0.2.5
 uvicorn==0.28.0
 pypdf==6.19.0
 unstructured==0.27.8
+# unstructured >=0.24 lazily downloads this spaCy model from GitHub on first use; install it at build time instead (same pin/hash unstructured 0.27.8 expects).
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85
 markdown==3.8.2
 networkx==3.2.1
 pandas==2.2.1
@@ -20,11 +22,11 @@ python-docx==1.1.2  # .docx header/footer extraction (pandoc drops them)
 pypandoc==1.15
 python-oxmsg==0.0.2  # .msg (Outlook) extraction; also a transitive of unstructured
 Pillow==12.3.0  # normalize standalone images (incl. multi-page TIFF) for OCR
-PyJWT==2.13.0
+PyJWT==2.15.1
 asyncpg==0.29.0
 python-multipart==0.0.32
 aiofiles==24.1.0
-pymongo==4.17.0
+pymongo==4.18.2
 langchain-mongodb==0.11.0
 cryptography==50.0.1
 python-magic==0.4.27
