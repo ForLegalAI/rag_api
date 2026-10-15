@@ -1,30 +1,34 @@
 name: CI
 
+# Tests only, and only on pull requests labelled "CI". Adding the label starts a
+# run; later pushes to a labelled PR re-run it. Images are built by CD (cd.yml).
 on:
-  push:
-    branches: [ main ]
   pull_request:
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  contents: read
 
 jobs:
-  build-and-test:
+  test:
+    # Skip runs triggered by adding some other label.
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'CI') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'CI')
     runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: test_key
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.lite.txt', 'test_requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          cache: pip
+          cache-dependency-path: |
+            requirements.lite.txt
+            test_requirements.txt
 
       - name: Install pandoc
         # The .docx /text path converts through pandoc, and the end-to-end tests
@@ -36,22 +40,13 @@ jobs:
 
       - name: Install dependencies
         # Test against the lite dependency set: it is the only image we ship.
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.lite.txt
-          pip install -r test_requirements.txt
+        run: pip install -r requirements.lite.txt -r test_requirements.txt
 
       - name: Run unit tests
-        env:
-          OPENAI_API_KEY: test_key
-        run: |
-          pytest -ra --maxfail=1 --disable-warnings --junitxml=test-results-unit.xml
+        run: pytest -ra --maxfail=1 --disable-warnings --junitxml=test-results-unit.xml
 
       - name: Run integration tests (pgvector container)
-        env:
-          OPENAI_API_KEY: test_key
-        run: |
-          pytest -m integration --maxfail=3 --disable-warnings --junitxml=test-results-integration.xml
+        run: pytest -m integration --maxfail=3 --disable-warnings --junitxml=test-results-integration.xml
 
       - name: Upload test results
         if: always()
