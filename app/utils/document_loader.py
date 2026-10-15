@@ -16,6 +16,7 @@ from app.config import (
     logger,
     MISTRAL_API_KEY,
     MISTRAL_OCR_MODEL,
+    MISTRAL_SERVER_URL,
     DOCX_TEXT_USE_PANDOC,
     DOCX_TEXT_TRACK_CHANGES,
     DOCX_TEXT_INCLUDE_HEADERS_FOOTERS,
@@ -319,6 +320,11 @@ def _mistral_ocr_client():
             "MISTRAL_API_KEY is not set. Please configure it in environment variables."
         )
 
+    # Only pass server_url when configured so the SDK keeps its own default.
+    # Regional endpoints (e.g. api.eu.mistral.ai) lack the Files API; OCR here
+    # sends documents inline as base64, so it works against them unchanged.
+    if MISTRAL_SERVER_URL:
+        return Mistral(api_key=MISTRAL_API_KEY, server_url=MISTRAL_SERVER_URL)
     return Mistral(api_key=MISTRAL_API_KEY)
 
 

@@ -221,6 +221,9 @@ GOOGLE_APPLICATION_CREDENTIALS = get_env_variable("GOOGLE_APPLICATION_CREDENTIAL
 # Mistral OCR settings
 MISTRAL_API_KEY = get_env_variable("MISTRAL_API_KEY", "")
 MISTRAL_OCR_MODEL = get_env_variable("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
+# Override the Mistral API base URL, e.g. https://api.eu.mistral.ai for EU-only
+# deployments. Empty keeps the SDK default (https://api.mistral.ai).
+MISTRAL_SERVER_URL = get_env_variable("MISTRAL_SERVER_URL", "").rstrip("/")
 
 # DOCX handling for the /text endpoint: when enabled, .docx files are converted
 # via pandoc so tracked changes and comments are preserved (the embedding path
