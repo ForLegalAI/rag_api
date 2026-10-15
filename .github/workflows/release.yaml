@@ -1,10 +1,13 @@
 name: Docker Dev Images Release
 
+# Manual only: pushing a git tag no longer publishes images.
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - '*'
+    inputs:
+      tag:
+        description: 'Image tag to publish (defaults to the selected branch or tag name)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -17,4 +20,4 @@ jobs:
     # secrets unless they are passed.
     secrets: inherit
     with:
-      tag: ${{ github.ref_name }}
+      tag: ${{ inputs.tag || github.ref_name }}

@@ -1,12 +1,9 @@
 name: Docker Dev Images Build
 
+# Manual only: images are published on demand, not on every push to main.
+# Only the lite image is built; the full image (Dockerfile) is not published.
 on:
   workflow_dispatch:
-  push:
-    paths-ignore:
-      - 'README.md'
-    branches:
-      - main
 
 jobs:
   build:
@@ -17,9 +14,6 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: main
-            file: Dockerfile
-            image_name: librechat-rag-api-dev
           - target: lite
             file: Dockerfile.lite
             image_name: librechat-rag-api-dev-lite
@@ -100,7 +94,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image_name: [librechat-rag-api-dev, librechat-rag-api-dev-lite]
+        image_name: [librechat-rag-api-dev-lite]
 
     steps:
       - name: Copy the published tags

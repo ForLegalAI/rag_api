@@ -22,7 +22,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'test_requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.lite.txt', 'test_requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -35,9 +35,10 @@ jobs:
           pandoc --version | head -1
 
       - name: Install dependencies
+        # Test against the lite dependency set: it is the only image we ship.
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.lite.txt
           pip install -r test_requirements.txt
 
       - name: Run unit tests
