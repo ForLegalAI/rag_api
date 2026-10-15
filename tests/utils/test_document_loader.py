@@ -203,6 +203,45 @@ def test_safe_pdf_loader_requires_api_key():
             loader.load()
 
 
+def test_mistral_client_uses_sdk_default_server_without_override():
+    """Without MISTRAL_SERVER_URL the client is built with the SDK's default server."""
+    from app.utils import document_loader
+
+    fake_module, _ = _make_mistral_module(pages=[])
+
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(
+        document_loader, "MISTRAL_API_KEY", "test-key"
+    ), patch.object(document_loader, "MISTRAL_SERVER_URL", ""):
+        document_loader._mistral_ocr_client()
+
+    fake_module.Mistral.assert_called_once_with(api_key="test-key")
+
+
+def test_mistral_client_uses_configured_server_url():
+    """MISTRAL_SERVER_URL (e.g. the EU regional endpoint) is passed to the client."""
+    from app.utils import document_loader
+    from app.utils.document_loader import SafePyPDFLoader
+
+    fake_module, client = _make_mistral_module(pages=[])
+
+    loader = SafePyPDFLoader("dummy.pdf")
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(
+        document_loader, "MISTRAL_API_KEY", "test-key"
+    ), patch.object(
+        document_loader, "MISTRAL_SERVER_URL", "https://api.eu.mistral.ai"
+    ), patch.object(SafePyPDFLoader, "_encode_pdf_b64", return_value="b64data"):
+        loader.load()
+
+    fake_module.Mistral.assert_called_once_with(
+        api_key="test-key", server_url="https://api.eu.mistral.ai"
+    )
+    client.ocr.process.assert_called_once()
+
+
 MARKDOWN_SAMPLE = (
     "# Heading\n\n"
     "**bold** and *italic* text with a [link](https://example.com).\n\n"
