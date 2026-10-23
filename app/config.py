@@ -224,6 +224,25 @@ MISTRAL_OCR_MODEL = get_env_variable("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
 # Override the Mistral API base URL, e.g. https://api.eu.mistral.ai for EU-only
 # deployments. Empty keeps the SDK default (https://api.mistral.ai).
 MISTRAL_SERVER_URL = get_env_variable("MISTRAL_SERVER_URL", "").rstrip("/")
+# Mistral OCR returns only a placeholder (![img-0.jpeg](img-0.jpeg)) for a raster
+# image embedded in a PDF page, without transcribing the text inside it. When
+# enabled, the extracted images are requested and OCR'd separately, and the
+# recognized text replaces the placeholder. Every image costs one extra OCR page.
+MISTRAL_OCR_EMBEDDED_IMAGES = (
+    get_env_variable("MISTRAL_OCR_EMBEDDED_IMAGES", "True").lower() == "true"
+)
+# Smallest image side (pixels) Mistral extracts, so logos/icons aren't OCR'd.
+MISTRAL_OCR_IMAGE_MIN_SIZE = max(
+    0, int(get_env_variable("MISTRAL_OCR_IMAGE_MIN_SIZE", "100"))
+)
+# Max embedded images extracted (and OCR'd) per document; <= 0 means no cap.
+MISTRAL_OCR_MAX_EMBEDDED_IMAGES = int(
+    get_env_variable("MISTRAL_OCR_MAX_EMBEDDED_IMAGES", "50")
+)
+# Number of embedded images OCR'd in parallel (minimum 1).
+MISTRAL_OCR_IMAGE_CONCURRENCY = max(
+    1, int(get_env_variable("MISTRAL_OCR_IMAGE_CONCURRENCY", "4"))
+)
 
 # DOCX handling for the /text endpoint: when enabled, .docx files are converted
 # via pandoc so tracked changes and comments are preserved (the embedding path
