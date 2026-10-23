@@ -1,5 +1,7 @@
 import os
 from collections.abc import Iterator
+from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -127,6 +129,8 @@ def test_safe_pdf_loader_ocr_maps_pages():
     with patch.dict(
         "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
     ), patch.object(
+        document_loader, "MISTRAL_OCR_EMBEDDED_IMAGES", False
+    ), patch.object(
         document_loader, "MISTRAL_API_KEY", "test-key"
     ), patch.object(SafePyPDFLoader, "_encode_pdf_b64", return_value="b64data"):
         result = loader.load()
@@ -160,6 +164,8 @@ def test_safe_pdf_loader_empty_pages_returns_placeholder():
     with patch.dict(
         "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
     ), patch.object(
+        document_loader, "MISTRAL_OCR_EMBEDDED_IMAGES", False
+    ), patch.object(
         document_loader, "MISTRAL_API_KEY", "test-key"
     ), patch.object(SafePyPDFLoader, "_encode_pdf_b64", return_value="b64data"):
         result = loader.load()
@@ -179,6 +185,8 @@ def test_safe_pdf_loader_ocr_error_propagates():
     loader = SafePyPDFLoader("dummy.pdf")
     with patch.dict(
         "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(
+        document_loader, "MISTRAL_OCR_EMBEDDED_IMAGES", False
     ), patch.object(
         document_loader, "MISTRAL_API_KEY", "test-key"
     ), patch.object(SafePyPDFLoader, "_encode_pdf_b64", return_value="b64data"):
@@ -230,6 +238,8 @@ def test_mistral_client_uses_configured_server_url():
     with patch.dict(
         "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
     ), patch.object(
+        document_loader, "MISTRAL_OCR_EMBEDDED_IMAGES", False
+    ), patch.object(
         document_loader, "MISTRAL_API_KEY", "test-key"
     ), patch.object(
         document_loader, "MISTRAL_SERVER_URL", "https://api.eu.mistral.ai"
@@ -240,6 +250,932 @@ def test_mistral_client_uses_configured_server_url():
         api_key="test-key", server_url="https://api.eu.mistral.ai"
     )
     client.ocr.process.assert_called_once()
+
+
+# --- Embedded-image OCR inside PDFs -----------------------------------------
+
+
+def _ocr_page(markdown, images=(), dimensions=None):
+    return SimpleNamespace(markdown=markdown, images=list(images), dimensions=dimensions)
+
+
+def _ocr_image(image_id, image_base64, bbox=None):
+    """``bbox`` is ``(top_left_x, top_left_y, bottom_right_x, bottom_right_y)``."""
+    corners = dict(
+        zip(("top_left_x", "top_left_y", "bottom_right_x", "bottom_right_y"), bbox or ())
+    )
+    return SimpleNamespace(id=image_id, image_base64=image_base64, **corners)
+
+
+def _load_pdf_with_images(pages, image_results=None, **settings):
+    """Load a PDF through a fake Mistral client that serves per-image OCR results.
+
+    ``image_results`` maps an image's base64 payload to the text its OCR call
+    returns (a str, a list of page texts, or an Exception to raise). ``settings``
+    override ``document_loader`` module settings (defaults are pinned so tests
+    don't depend on the environment). Returns ``(documents, client)``.
+    """
+    from app.utils import document_loader
+    from app.utils.document_loader import SafePyPDFLoader
+
+    settings = {
+        "MISTRAL_OCR_EMBEDDED_IMAGES": True,
+        "MISTRAL_OCR_IMAGE_MIN_SIZE": 100,
+        "MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION": 0.1,
+        "MISTRAL_OCR_MAX_EXTRACTED_IMAGES": 200,
+        "MISTRAL_OCR_MAX_EMBEDDED_IMAGES": 50,
+        "MISTRAL_OCR_IMAGE_CONCURRENCY": 4,
+        **settings,
+    }
+    results = image_results or {}
+
+    def process(**kwargs):
+        document = kwargs["document"]
+        if document["type"] == "document_url":
+            return pages if isinstance(pages, dict) else SimpleNamespace(pages=pages)
+        outcome = results[document["image_url"].split(",", 1)[1]]
+        if isinstance(outcome, Exception):
+            raise outcome
+        texts = outcome if isinstance(outcome, list) else [outcome]
+        return SimpleNamespace(pages=[SimpleNamespace(markdown=t) for t in texts])
+
+    fake_module, client = _make_mistral_module(pages=[])
+    client.ocr.process.side_effect = process
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.dict("sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module})
+        )
+        stack.enter_context(patch.object(document_loader, "MISTRAL_API_KEY", "test-key"))
+        stack.enter_context(
+            patch.object(SafePyPDFLoader, "_encode_pdf_b64", return_value="b64data")
+        )
+        for name, value in settings.items():
+            stack.enter_context(patch.object(document_loader, name, value))
+        documents = SafePyPDFLoader("scan.pdf").load()
+    return documents, client
+
+
+def _image_calls(client):
+    return [
+        c.kwargs
+        for c in client.ocr.process.call_args_list
+        if c.kwargs["document"]["type"] == "image_url"
+    ]
+
+
+def test_pdf_embedded_image_text_replaces_placeholder():
+    """The image's OCR text takes the placeholder's place; page text and metadata stay."""
+    pages = [
+        _ocr_page(
+            "Before\n\n![img-0.jpeg](img-0.jpeg)\n\nAfter",
+            [_ocr_image("img-0.jpeg", "AAA")],
+        )
+    ]
+
+    docs, client = _load_pdf_with_images(pages, {"AAA": "  Text from the scan  "})
+
+    assert len(docs) == 1
+    assert docs[0].page_content == "Before\n\nText from the scan\n\nAfter"
+    assert docs[0].metadata == {"source": "scan.pdf", "page": 1}
+    assert "![img-0.jpeg]" not in docs[0].page_content
+    assert client.ocr.process.call_count == 2
+
+
+def test_pdf_embedded_images_request_kwargs_when_enabled():
+    """The main request asks for image bytes with the configured size and limit."""
+    docs, client = _load_pdf_with_images(
+        [_ocr_page("text")],
+        MISTRAL_OCR_EMBEDDED_IMAGES=True,
+        MISTRAL_OCR_IMAGE_MIN_SIZE=123,
+        MISTRAL_OCR_MAX_EXTRACTED_IMAGES=7,
+    )
+
+    client.ocr.process.assert_called_once()
+    kwargs = client.ocr.process.call_args.kwargs
+    assert kwargs["document"]["type"] == "document_url"
+    assert kwargs["include_image_base64"] is True
+    assert kwargs["include_blocks"] is False
+    assert kwargs["image_min_size"] == 123
+    assert kwargs["image_limit"] == 8  # cap + 1, so exceeding the cap is detectable
+
+
+def test_pdf_embedded_images_disabled_keeps_original_request():
+    """With the feature off the request is as before and no image is OCR'd."""
+    pages = [_ocr_page("![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "AAA")])]
+
+    docs, client = _load_pdf_with_images(
+        pages, {"AAA": "never read"}, MISTRAL_OCR_EMBEDDED_IMAGES=False
+    )
+
+    client.ocr.process.assert_called_once()
+    kwargs = client.ocr.process.call_args.kwargs
+    assert kwargs["include_image_base64"] is False
+    assert kwargs["include_blocks"] is False
+    assert "image_min_size" not in kwargs
+    assert "image_limit" not in kwargs
+    assert docs[0].page_content == "![img-0.jpeg](img-0.jpeg)"
+
+
+@pytest.mark.parametrize("image_text", ["![img-0.jpeg](img-0.jpeg)", "   ", ""])
+def test_pdf_embedded_image_without_text_keeps_placeholder(image_text):
+    """An image that yields only placeholders/whitespace leaves the original placeholder."""
+    pages = [_ocr_page("A ![img-0.jpeg](img-0.jpeg) B", [_ocr_image("img-0.jpeg", "AAA")])]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": image_text})
+
+    assert docs[0].page_content == "A ![img-0.jpeg](img-0.jpeg) B"
+
+
+def test_pdf_embedded_image_nested_placeholders_are_stripped():
+    pages = [_ocr_page("![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "AAA")])]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": "Real text ![img-0.jpeg](img-0.jpeg)"})
+
+    assert docs[0].page_content.strip() == "Real text"
+
+
+def test_pdf_embedded_image_multiple_ocr_pages_joined_with_blank_line():
+    pages = [_ocr_page("![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "AAA")])]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": ["first", "second"]})
+
+    assert docs[0].page_content.strip() == "first\n\nsecond"
+
+
+def test_pdf_embedded_image_failure_keeps_placeholder_and_other_images(caplog):
+    """One failed image OCR call doesn't fail the document or the other images."""
+    pages = [
+        _ocr_page(
+            "![img-0.jpeg](img-0.jpeg) | ![img-1.jpeg](img-1.jpeg)",
+            [_ocr_image("img-0.jpeg", "SECRETB64"), _ocr_image("img-1.jpeg", "BBB")],
+        )
+    ]
+
+    with caplog.at_level("WARNING"):
+        docs, _ = _load_pdf_with_images(
+            pages, {"SECRETB64": RuntimeError("boom"), "BBB": "second image"}
+        )
+
+    # A non-fatal image failure is a warning, never an error.
+    assert [r.levelname for r in caplog.records if "img-0.jpeg" in r.getMessage()] == [
+        "WARNING"
+    ]
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+    content = docs[0].page_content
+    assert "![img-0.jpeg](img-0.jpeg)" in content
+    assert "second image" in content
+    assert "img-0.jpeg" in caplog.text and "scan.pdf" in caplog.text
+    assert "SECRETB64" not in caplog.text
+
+
+def test_pdf_main_ocr_failure_still_raises_and_logs_error(caplog):
+    from app.utils import document_loader
+    from app.utils.document_loader import SafePyPDFLoader
+
+    fake_module, _ = _make_mistral_module(raise_exc=RuntimeError("OCR boom"))
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(document_loader, "MISTRAL_API_KEY", "test-key"), patch.object(
+        document_loader, "MISTRAL_OCR_EMBEDDED_IMAGES", True
+    ), patch.object(
+        SafePyPDFLoader, "_encode_pdf_b64", return_value="b64data"
+    ), caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="OCR boom"):
+        SafePyPDFLoader("scan.pdf").load()
+
+    assert [r.levelname for r in caplog.records if "OCR boom" in r.getMessage()] == ["ERROR"]
+
+
+def test_pdf_embedded_image_base64_without_prefix_gets_data_uri():
+    pages = [
+        _ocr_page(
+            "![a.png](a.png) ![b.jpg](b.jpg) ![c.bin](c.bin) ![d.jpeg](d.jpeg)"
+            " ![e.gif](e.gif) ![f.pdf](f.pdf)",
+            [
+                _ocr_image("a.png", "AAA"),
+                _ocr_image("b.jpg", "BBB"),
+                _ocr_image("c.bin", "CCC"),
+                _ocr_image("d.jpeg", "data:image/webp;base64,DDD"),
+                _ocr_image("e.gif", "EEE"),
+                _ocr_image("f.pdf", "FFF"),
+            ],
+        )
+    ]
+
+    _, client = _load_pdf_with_images(
+        pages, {"AAA": "a", "BBB": "b", "CCC": "c", "DDD": "d", "EEE": "e", "FFF": "f"}
+    )
+
+    sent = sorted(c["document"]["image_url"] for c in _image_calls(client))
+    assert sent == [
+        "data:image/gif;base64,EEE",
+        "data:image/jpeg;base64,BBB",
+        "data:image/jpeg;base64,CCC",  # unknown extension
+        "data:image/jpeg;base64,FFF",  # a non-image mime is not trusted
+        "data:image/png;base64,AAA",
+        "data:image/webp;base64,DDD",
+    ]
+
+
+def test_pdf_embedded_image_cap_limits_image_ocr_calls(caplog):
+    """More distinct images than the cap: the first ``cap`` are OCR'd, with a warning."""
+    pages = [
+        _ocr_page(
+            "![img-0.jpeg](img-0.jpeg) ![img-1.jpeg](img-1.jpeg)",
+            [_ocr_image("img-0.jpeg", "AAA"), _ocr_image("img-1.jpeg", "BBB")],
+        )
+    ]
+
+    with caplog.at_level("WARNING"):
+        docs, client = _load_pdf_with_images(
+            pages,
+            {"AAA": "first", "BBB": "second"},
+            MISTRAL_OCR_MAX_EMBEDDED_IMAGES=1,
+        )
+
+    assert len(_image_calls(client)) == 1
+    assert "first" in docs[0].page_content
+    assert "![img-1.jpeg](img-1.jpeg)" in docs[0].page_content
+    assert "MISTRAL_OCR_MAX_EMBEDDED_IMAGES" in caplog.text
+
+
+def test_pdf_embedded_images_exactly_at_cap_do_not_warn(caplog):
+    pages = [_ocr_page("![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "AAA")])]
+
+    with caplog.at_level("WARNING"):
+        docs, client = _load_pdf_with_images(
+            pages, {"AAA": "text"}, MISTRAL_OCR_MAX_EMBEDDED_IMAGES=1
+        )
+
+    assert len(_image_calls(client)) == 1
+    assert docs[0].page_content == "text"
+    assert "MISTRAL_OCR_MAX_EMBEDDED_IMAGES" not in caplog.text
+
+
+def test_pdf_embedded_images_cap_counts_distinct_images_not_duplicates(caplog):
+    """Identical images are one OCR call, so they don't use up the cap."""
+    pages = [
+        _ocr_page(
+            "![img-0.jpeg](img-0.jpeg) ![img-1.jpeg](img-1.jpeg)",
+            [_ocr_image("img-0.jpeg", "AAA"), _ocr_image("img-1.jpeg", "AAA")],
+        )
+    ]
+
+    with caplog.at_level("WARNING"):
+        docs, client = _load_pdf_with_images(
+            pages, {"AAA": "same"}, MISTRAL_OCR_MAX_EMBEDDED_IMAGES=1
+        )
+
+    assert len(_image_calls(client)) == 1
+    assert docs[0].page_content == "same same"
+    assert "MISTRAL_OCR_MAX_EMBEDDED_IMAGES" not in caplog.text
+
+
+def test_pdf_embedded_images_truncated_by_cap_keep_placeholders_for_all_their_copies():
+    pages = [
+        _ocr_page("![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "AAA")]),
+        _ocr_page("![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "BBB")]),
+        _ocr_page("![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "BBB")]),
+    ]
+
+    docs, client = _load_pdf_with_images(
+        pages, {"AAA": "first", "BBB": "second"}, MISTRAL_OCR_MAX_EMBEDDED_IMAGES=1
+    )
+
+    assert len(_image_calls(client)) == 1
+    assert [d.page_content for d in docs] == [
+        "first",
+        "![img-0.jpeg](img-0.jpeg)",
+        "![img-0.jpeg](img-0.jpeg)",
+    ]
+
+
+def test_pdf_embedded_images_skipped_logos_do_not_use_up_the_extraction_cap():
+    """A small logo on each of 60 pages is filtered; the big photo on page 55 is still OCR'd."""
+    logo_bbox, photo_bbox = (0, 0, 100, 100), (0, 0, 800, 800)
+    pages = [
+        _ocr_page(
+            "![img-0.jpeg](img-0.jpeg)",
+            [_ocr_image("img-0.jpeg", "LOGO", logo_bbox)]
+            + ([_ocr_image("img-1.jpeg", "PHOTO", photo_bbox)] if number == 55 else []),
+            PAGE,
+        )
+        for number in range(1, 61)
+    ]
+
+    docs, client = _load_pdf_with_images(
+        pages, {"PHOTO": "photo text"}, MISTRAL_OCR_MAX_EMBEDDED_IMAGES=2
+    )
+
+    assert [c["document"]["image_url"] for c in _image_calls(client)] == [
+        "data:image/jpeg;base64,PHOTO"
+    ]
+    assert client.ocr.process.call_args_list[0].kwargs["image_limit"] == 201
+    assert "photo text" in docs[54].page_content
+
+
+def test_pdf_embedded_images_over_the_extraction_cap_warn_and_are_dropped(caplog):
+    pages = [
+        _ocr_page(
+            "![img-0.jpeg](img-0.jpeg) ![img-1.jpeg](img-1.jpeg)",
+            [_ocr_image("img-0.jpeg", "AAA"), _ocr_image("img-1.jpeg", "BBB")],
+        )
+    ]
+
+    with caplog.at_level("WARNING"):
+        docs, client = _load_pdf_with_images(
+            pages, {"AAA": "first", "BBB": "second"}, MISTRAL_OCR_MAX_EXTRACTED_IMAGES=1
+        )
+
+    assert len(_image_calls(client)) == 1
+    assert docs[0].page_content == "first ![img-1.jpeg](img-1.jpeg)"
+    assert "MISTRAL_OCR_MAX_EXTRACTED_IMAGES=1" in caplog.text
+    assert "not extracted" in caplog.text
+
+
+def test_pdf_embedded_images_at_the_extraction_cap_do_not_warn(caplog):
+    pages = [_ocr_page("![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "AAA")])]
+
+    with caplog.at_level("WARNING"):
+        _load_pdf_with_images(pages, {"AAA": "text"}, MISTRAL_OCR_MAX_EXTRACTED_IMAGES=1)
+
+    assert "MISTRAL_OCR_MAX_EXTRACTED_IMAGES" not in caplog.text
+
+
+def test_pdf_embedded_image_only_normalizes_newlines_around_placeholder():
+    pages = [
+        _ocr_page(
+            "![img-0.jpeg](img-0.jpeg)\n\nkept\n\n\n\nspacing",
+            [_ocr_image("img-0.jpeg", "AAA")],
+        )
+    ]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": "text"})
+
+    assert docs[0].page_content == "text\n\nkept\n\n\n\nspacing"
+
+
+def test_pdf_embedded_image_ids_are_scoped_per_page():
+    """Every page may have its own ``img-0.jpeg``; each gets its own text."""
+    pages = [
+        _ocr_page("P1 ![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "AAA")]),
+        _ocr_page("P2 ![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "BBB")]),
+    ]
+
+    docs, _ = _load_pdf_with_images(
+        pages, {"AAA": "text one", "BBB": "text two"}, MISTRAL_OCR_IMAGE_CONCURRENCY=2
+    )
+
+    assert "text one" in docs[0].page_content and "text two" not in docs[0].page_content
+    assert "text two" in docs[1].page_content and "text one" not in docs[1].page_content
+    assert [d.metadata["page"] for d in docs] == [1, 2]
+
+
+def test_pdf_embedded_image_text_lands_at_own_placeholder_when_calls_finish_out_of_order():
+    """The first image's OCR call only finishes after the second one has."""
+    import threading
+
+    from app.utils import document_loader
+    from app.utils.document_loader import SafePyPDFLoader
+
+    second_done = threading.Event()
+
+    def process(**kwargs):
+        document = kwargs["document"]
+        if document["type"] == "document_url":
+            return SimpleNamespace(
+                pages=[
+                    _ocr_page(
+                        "![img-0.jpeg](img-0.jpeg)\n\n![img-1.jpeg](img-1.jpeg)",
+                        [_ocr_image("img-0.jpeg", "AAA"), _ocr_image("img-1.jpeg", "BBB")],
+                    )
+                ]
+            )
+        if document["image_url"].endswith("AAA"):
+            assert second_done.wait(timeout=10), "second image OCR never completed"
+            text = "first text"
+        else:
+            text = "second text"
+            second_done.set()
+        return SimpleNamespace(pages=[SimpleNamespace(markdown=text)])
+
+    fake_module, client = _make_mistral_module(pages=[])
+    client.ocr.process.side_effect = process
+
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(document_loader, "MISTRAL_API_KEY", "test-key"), patch.object(
+        document_loader, "MISTRAL_OCR_EMBEDDED_IMAGES", True
+    ), patch.object(
+        document_loader, "MISTRAL_OCR_IMAGE_CONCURRENCY", 2
+    ), patch.object(
+        document_loader, "_IMAGE_OCR_SLOTS", threading.BoundedSemaphore(2)
+    ), patch.object(
+        SafePyPDFLoader, "_encode_pdf_b64", return_value="b64data"
+    ):
+        docs = SafePyPDFLoader("scan.pdf").load()
+
+    assert docs[0].page_content == "first text\n\nsecond text"
+
+
+def test_image_ocr_calls_are_bounded_across_documents_loaded_concurrently():
+    """The slot limit is global: two documents never run more image OCR calls at once than it allows."""
+    import threading
+
+    from app.utils import document_loader
+    from app.utils.document_loader import SafePyPDFLoader
+
+    lock = threading.Lock()
+    overlap = threading.Event()
+    in_flight = max_in_flight = 0
+    first_call = True
+
+    def process(**kwargs):
+        nonlocal in_flight, max_in_flight, first_call
+        document = kwargs["document"]
+        if document["type"] == "document_url":
+            tag = document["document_url"].rsplit("-", 1)[1]
+            images = [_ocr_image(f"img-{n}.jpeg", f"{tag}{n}") for n in (0, 1)]
+            markdown = "\n\n".join(f"![img-{n}.jpeg](img-{n}.jpeg)" for n in (0, 1))
+            return SimpleNamespace(pages=[_ocr_page(markdown, images)])
+        with lock:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            if in_flight > 1:
+                overlap.set()
+            waits, first_call = first_call, False
+        if waits:
+            # Hold the slot until a second call overlaps; with a limit of 1 none can,
+            # so this times out and the call carries on.
+            overlap.wait(timeout=1)
+        with lock:
+            in_flight -= 1
+        return SimpleNamespace(pages=[SimpleNamespace(markdown="text")])
+
+    fake_module, client = _make_mistral_module(pages=[])
+    client.ocr.process.side_effect = process
+    results = {}
+
+    def load(name):
+        results[name] = SafePyPDFLoader(name).load()
+
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(document_loader, "MISTRAL_API_KEY", "test-key"), patch.object(
+        document_loader, "MISTRAL_OCR_EMBEDDED_IMAGES", True
+    ), patch.object(
+        document_loader, "MISTRAL_OCR_IMAGE_CONCURRENCY", 4
+    ), patch.object(
+        document_loader, "_IMAGE_OCR_SLOTS", threading.BoundedSemaphore(1)
+    ), patch.object(
+        SafePyPDFLoader, "_encode_pdf_b64", lambda self: f"pdf-{self.filepath}"
+    ):
+        threads = [threading.Thread(target=load, args=(name,)) for name in ("A", "B")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+    assert max_in_flight == 1
+    assert {name: docs[0].page_content for name, docs in results.items()} == {
+        "A": "text\n\ntext",
+        "B": "text\n\ntext",
+    }
+
+
+def test_pdf_embedded_image_without_placeholder_is_appended():
+    pages = [_ocr_page("Page body", [_ocr_image("img-0.jpeg", "AAA")])]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": "hidden text"})
+
+    assert docs[0].page_content == "Page body\n\nhidden text"
+
+
+@pytest.mark.parametrize("alt", ["", "image", "img-0.jpeg"])
+def test_pdf_embedded_image_placeholder_matches_any_alt_text(alt):
+    pages = [
+        _ocr_page(f"Before\n\n![{alt}](img-0.jpeg)\n\nAfter", [_ocr_image("img-0.jpeg", "AAA")])
+    ]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": "scanned"})
+
+    assert docs[0].page_content == "Before\n\nscanned\n\nAfter"
+
+
+def test_pdf_embedded_image_placeholder_does_not_match_other_image_ids():
+    pages = [
+        _ocr_page(
+            "![x](img-10.jpeg) and ![x](other-img-1.jpeg)",
+            [_ocr_image("img-1.jpeg", "AAA")],
+        )
+    ]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": "scanned"})
+
+    assert docs[0].page_content.startswith("![x](img-10.jpeg) and ![x](other-img-1.jpeg)")
+    assert docs[0].page_content.endswith("\n\nscanned")
+
+
+def test_pdf_embedded_image_inline_in_sentence_is_not_split_into_paragraphs():
+    pages = [
+        _ocr_page(
+            "See ![img-0.jpeg](img-0.jpeg) for details.", [_ocr_image("img-0.jpeg", "AAA")]
+        )
+    ]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": "line one\n\nline two\nline three"})
+
+    assert docs[0].page_content == "See line one line two line three for details."
+
+
+def test_pdf_embedded_image_in_table_cell_stays_in_its_row_with_pipes_escaped():
+    markdown = "| Name | Scan |\n| --- | --- |\n| Ann | ![img-0.jpeg](img-0.jpeg) |\n| Bob | n/a |"
+    pages = [_ocr_page(markdown, [_ocr_image("img-0.jpeg", "AAA")])]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": "a | b\nsecond line"})
+
+    assert docs[0].page_content == (
+        "| Name | Scan |\n| --- | --- |\n| Ann | a \\| b second line |\n| Bob | n/a |"
+    )
+
+
+def test_pdf_embedded_image_alone_on_indented_line_becomes_paragraph():
+    pages = [_ocr_page("Intro\n  ![img-0.jpeg](img-0.jpeg)  \nOutro", [_ocr_image("img-0.jpeg", "AAA")])]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": "a\n\nb"})
+
+    assert docs[0].page_content == "Intro\n\na\n\nb\n\nOutro"
+
+
+@pytest.mark.parametrize(
+    "marker", ["#", "######", "-", "*", "+", ">", "1.", "12)", "  -", "\t>"]
+)
+def test_pdf_embedded_image_behind_a_block_marker_becomes_a_paragraph_without_the_marker(marker):
+    pages = [
+        _ocr_page(
+            f"Intro\n{marker} ![img-0.jpeg](img-0.jpeg)\nOutro", [_ocr_image("img-0.jpeg", "AAA")]
+        )
+    ]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": "a\nb"})
+
+    assert docs[0].page_content == "Intro\n\na\nb\n\nOutro"
+
+
+def test_pdf_embedded_image_in_the_middle_of_a_list_leaves_the_other_items():
+    pages = [
+        _ocr_page(
+            "- one\n- ![img-0.jpeg](img-0.jpeg)\n- three", [_ocr_image("img-0.jpeg", "AAA")]
+        )
+    ]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": "scan"})
+
+    assert docs[0].page_content == "- one\n\nscan\n\n- three"
+
+
+def test_pdf_embedded_image_after_a_marker_but_followed_by_text_stays_inline():
+    pages = [
+        _ocr_page(
+            "- ![img-0.jpeg](img-0.jpeg) caption", [_ocr_image("img-0.jpeg", "AAA")]
+        )
+    ]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": "a\nb"})
+
+    assert docs[0].page_content == "- a b caption"
+
+
+def test_pdf_embedded_image_repeated_on_a_page_is_inserted_once_at_the_first_occurrence():
+    pages = [
+        _ocr_page(
+            "Top\n\n![img-0.jpeg](img-0.jpeg)\n\nMiddle\n\n![img-0.jpeg](img-0.jpeg)\n\nEnd",
+            [_ocr_image("img-0.jpeg", "AAA")],
+        )
+    ]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": "scan"})
+
+    assert docs[0].page_content == "Top\n\nscan\n\nMiddle\n\nEnd"
+
+
+def test_pdf_embedded_image_repeated_at_the_end_of_a_page_drops_its_line_cleanly():
+    pages = [
+        _ocr_page(
+            "![img-0.jpeg](img-0.jpeg)\n\nBody\n\n![img-0.jpeg](img-0.jpeg)\n",
+            [_ocr_image("img-0.jpeg", "AAA")],
+        )
+    ]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": "scan"})
+
+    assert docs[0].page_content == "scan\n\nBody"
+
+
+def test_pdf_embedded_image_repeated_inline_leaves_no_double_space():
+    pages = [
+        _ocr_page(
+            "See ![img-0.jpeg](img-0.jpeg) and ![img-0.jpeg](img-0.jpeg) now",
+            [_ocr_image("img-0.jpeg", "AAA")],
+        )
+    ]
+
+    docs, _ = _load_pdf_with_images(pages, {"AAA": "scan"})
+
+    assert docs[0].page_content == "See scan and now"
+
+
+# --- Repeated images: content dedupe and page-fraction filter ---
+
+
+def test_pdf_embedded_image_repeated_on_pages_is_ocrd_once_and_text_reused():
+    """A letterhead on every page costs one OCR call; each page still gets its text."""
+    pages = [
+        _ocr_page("![img-0.jpeg](img-0.jpeg)\n\nPage one", [_ocr_image("img-0.jpeg", "LOGO")]),
+        _ocr_page("Page two\n\n![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "LOGO")]),
+    ]
+
+    docs, client = _load_pdf_with_images(pages, {"LOGO": "ACME LAW LLP"})
+
+    assert len(_image_calls(client)) == 1
+    assert docs[0].page_content == "ACME LAW LLP\n\nPage one"
+    assert docs[1].page_content == "Page two\n\nACME LAW LLP"
+
+
+def test_pdf_embedded_image_dedupe_is_by_content_not_id():
+    pages = [
+        _ocr_page(
+            "![img-0.jpeg](img-0.jpeg) ![img-1.jpeg](img-1.jpeg)",
+            [_ocr_image("img-0.jpeg", "AAA"), _ocr_image("img-1.jpeg", "BBB")],
+        )
+    ]
+
+    docs, client = _load_pdf_with_images(pages, {"AAA": "first", "BBB": "second"})
+
+    assert len(_image_calls(client)) == 2
+    assert docs[0].page_content == "first second"
+
+
+PAGE = SimpleNamespace(width=1000, height=1000)  # 1,000,000 px^2
+
+
+def _sized_page(bbox, dimensions=PAGE):
+    return [
+        _ocr_page("![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "AAA", bbox)], dimensions)
+    ]
+
+
+def test_pdf_embedded_image_below_page_fraction_is_skipped_without_a_call():
+    # 200x200 = 4% of the page, below the 10% default.
+    docs, client = _load_pdf_with_images(
+        _sized_page((0, 0, 200, 200)), {"AAA": "never read"}
+    )
+
+    assert _image_calls(client) == []
+    assert docs[0].page_content == "![img-0.jpeg](img-0.jpeg)"
+
+
+def test_pdf_embedded_image_at_or_above_page_fraction_is_ocrd():
+    # 400x400 = 16% of the page.
+    docs, client = _load_pdf_with_images(_sized_page((100, 100, 500, 500)), {"AAA": "big"})
+
+    assert len(_image_calls(client)) == 1
+    assert docs[0].page_content == "big"
+
+
+def test_pdf_embedded_image_skipped_by_page_fraction_is_logged_at_debug(caplog):
+    with caplog.at_level("DEBUG"):
+        _load_pdf_with_images(_sized_page((0, 0, 200, 200)), {"AAA": "never read"})
+
+    skipped = [r for r in caplog.records if "Skipping embedded image" in r.getMessage()]
+    assert [r.levelname for r in skipped] == ["DEBUG"]
+    message = skipped[0].getMessage()
+    assert "img-0.jpeg" in message and "scan.pdf" in message and "4.0%" in message
+
+
+def test_pdf_embedded_images_outside_the_page_are_kept_with_one_units_warning(caplog):
+    """A box larger than its page suggests mismatched units, so the size filter is not trusted."""
+    pages = [
+        _ocr_page(
+            "![img-0.jpeg](img-0.jpeg) ![img-1.jpeg](img-1.jpeg)",
+            [
+                _ocr_image("img-0.jpeg", "AAA", (0, 0, 20, 20)),
+                _ocr_image("img-1.jpeg", "BBB", (0, 0, 2000, 2000)),
+            ],
+            PAGE,
+        ),
+        _ocr_page(
+            "![img-0.jpeg](img-0.jpeg)",
+            [_ocr_image("img-0.jpeg", "CCC", (0, 0, 1500, 30))],
+            PAGE,
+        ),
+    ]
+
+    with caplog.at_level("DEBUG"):
+        docs, client = _load_pdf_with_images(pages, {"BBB": "kept b", "CCC": "kept c"})
+
+    units = [r for r in caplog.records if "bounding box outside its page" in r.getMessage()]
+    assert [r.levelname for r in units] == ["WARNING"]  # once per document
+    assert "scan.pdf" in units[0].getMessage()
+    assert len(_image_calls(client)) == 2
+    assert docs[0].page_content == "![img-0.jpeg](img-0.jpeg) kept b"
+    assert docs[1].page_content == "kept c"
+
+
+def test_pdf_embedded_image_within_one_percent_of_the_page_edge_is_not_a_units_mismatch(caplog):
+    with caplog.at_level("WARNING"):
+        _load_pdf_with_images(_sized_page((0, 0, 1005, 1000)), {"AAA": "text"})
+
+    assert "bounding box outside its page" not in caplog.text
+
+
+def test_pdf_embedded_image_page_fraction_zero_disables_the_filter():
+    docs, client = _load_pdf_with_images(
+        _sized_page((0, 0, 10, 10)),
+        {"AAA": "tiny"},
+        MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION=0,
+    )
+
+    assert len(_image_calls(client)) == 1
+    assert docs[0].page_content == "tiny"
+
+
+@pytest.mark.parametrize(
+    "bbox, dimensions",
+    [
+        (None, PAGE),  # no coordinates at all
+        ((0, 0, None, 10), PAGE),  # one coordinate missing
+        ((0, 0, 10, 10), None),  # no page dimensions
+        ((0, 0, 10, 10), SimpleNamespace(width=None, height=1000)),
+        ((0, 0, 10, 10), SimpleNamespace(width=0, height=1000)),
+        ((0, 0, 10, 10), SimpleNamespace(width=1000, height=-5)),
+        ((10, 10, 0, 0), PAGE),  # inverted box
+    ],
+)
+def test_pdf_embedded_image_kept_when_page_fraction_cannot_be_computed(bbox, dimensions):
+    docs, client = _load_pdf_with_images(_sized_page(bbox, dimensions), {"AAA": "kept"})
+
+    assert len(_image_calls(client)) == 1
+    assert docs[0].page_content == "kept"
+
+
+def test_pdf_embedded_image_skipped_image_does_not_hide_a_repeat_that_is_large():
+    """Fractions are judged per occurrence: the large copy is still OCR'd and reused."""
+    pages = [
+        _ocr_page("![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "AAA", (0, 0, 100, 100))], PAGE),
+        _ocr_page("![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "AAA", (0, 0, 900, 900))], PAGE),
+    ]
+
+    docs, client = _load_pdf_with_images(pages, {"AAA": "text"})
+
+    assert len(_image_calls(client)) == 1
+    assert docs[0].page_content == "![img-0.jpeg](img-0.jpeg)"
+    assert docs[1].page_content == "text"
+
+
+# --- Retries ---
+
+
+def test_safe_pdf_loader_passes_the_retry_config_for_main_and_image_requests():
+    pages = [_ocr_page("![img-0.jpeg](img-0.jpeg)", [_ocr_image("img-0.jpeg", "AAA")])]
+
+    _, client = _load_pdf_with_images(pages, {"AAA": "text"})
+
+    calls = client.ocr.process.call_args_list
+    assert len(calls) == 2
+    retries = [c.kwargs.get("retries") for c in calls]
+    assert all(r is not None for r in retries)
+
+
+def test_mistral_ocr_retry_config_retries_transient_failures_with_backoff():
+    from app.utils import document_loader
+
+    config = document_loader._ocr_retries()
+
+    assert config.strategy == "backoff"
+    assert config.retry_connection_errors is True
+    assert config.backoff.initial_interval == 500
+    assert config.backoff.max_interval == 10_000
+    assert config.backoff.exponent == 1.5
+    assert config.backoff.max_elapsed_time == 60_000
+
+
+def _fast_retries():
+    """The loader's retry policy with intervals of a few milliseconds, so tests don't wait."""
+    from mistralai.client import utils
+
+    return utils.RetryConfig(
+        "backoff",
+        utils.BackoffStrategy(
+            initial_interval=1, max_interval=5, exponent=1.1, max_elapsed_time=2000
+        ),
+        retry_connection_errors=True,
+    )
+
+
+def test_mistral_ocr_call_survives_transient_http_errors_through_the_real_sdk():
+    """429 and 503 are retried by the SDK itself; the third attempt succeeds."""
+    import httpx
+    from mistralai.client import Mistral
+
+    from app.utils import document_loader
+
+    statuses = iter([429, 503, 200])
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        status = next(statuses)
+        if status != 200:
+            return httpx.Response(status, json={"message": "transient"})
+        page = {"index": 0, "markdown": "recovered", "images": [], "dimensions": None}
+        return httpx.Response(
+            200,
+            json={"pages": [page], "model": "m", "usage_info": {"pages_processed": 1}},
+        )
+
+    client = Mistral(
+        api_key="test-key", client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    with patch.object(document_loader, "_ocr_retries", _fast_retries):
+        pages = document_loader._ocr_pages(
+            client, {"type": "image_url", "image_url": "data:image/png;base64,AA"}
+        )
+
+    assert [p.markdown for p in pages] == ["recovered"]
+    assert len(requests) == 3
+
+
+def test_mistral_ocr_call_does_not_retry_client_errors_through_the_real_sdk():
+    import httpx
+    from mistralai.client import Mistral
+
+    from app.utils import document_loader
+
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(400, json={"message": "bad request"})
+
+    client = Mistral(
+        api_key="test-key", client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    with patch.object(document_loader, "_ocr_retries", _fast_retries), pytest.raises(Exception):
+        document_loader._ocr_pages(
+            client, {"type": "image_url", "image_url": "data:image/png;base64,AA"}
+        )
+
+    assert len(requests) == 1
+
+
+def test_pdf_embedded_images_support_dict_shaped_response():
+    response = {
+        "pages": [
+            {
+                "index": 0,
+                "markdown": "Top ![img-0.jpeg](img-0.jpeg)",
+                "images": [{"id": "img-0.jpeg", "image_base64": "AAA"}],
+            }
+        ]
+    }
+
+    docs, _ = _load_pdf_with_images(response, {"AAA": "from dict"})
+
+    assert docs[0].page_content.split() == ["Top", "from", "dict"]
+
+
+def test_pdf_embedded_images_skip_images_without_bytes():
+    pages = [
+        _ocr_page(
+            "![img-0.jpeg](img-0.jpeg)",
+            [_ocr_image("img-0.jpeg", None), _ocr_image("img-1.jpeg", "")],
+        )
+    ]
+
+    docs, client = _load_pdf_with_images(pages)
+
+    client.ocr.process.assert_called_once()
+    assert docs[0].page_content == "![img-0.jpeg](img-0.jpeg)"
+
+
+def test_image_ocr_loader_does_not_request_embedded_images(tmp_path):
+    from app.utils import document_loader
+    from app.utils.document_loader import ImageOCRLoader
+
+    p = tmp_path / "scan.png"
+    _make_png(str(p))
+    fake_module, client = _make_mistral_module(pages=[MagicMock(index=0, markdown="t")])
+
+    with patch.dict(
+        "sys.modules", {"mistralai": fake_module, "mistralai.client": fake_module}
+    ), patch.object(document_loader, "MISTRAL_API_KEY", "test-key"):
+        ImageOCRLoader(str(p)).load()
+
+    kwargs = client.ocr.process.call_args.kwargs
+    assert kwargs["include_image_base64"] is False
+    assert kwargs["include_blocks"] is False
+    assert "image_min_size" not in kwargs
 
 
 MARKDOWN_SAMPLE = (

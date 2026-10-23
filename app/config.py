@@ -224,6 +224,40 @@ MISTRAL_OCR_MODEL = get_env_variable("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
 # Override the Mistral API base URL, e.g. https://api.eu.mistral.ai for EU-only
 # deployments. Empty keeps the SDK default (https://api.mistral.ai).
 MISTRAL_SERVER_URL = get_env_variable("MISTRAL_SERVER_URL", "").rstrip("/")
+# Mistral OCR returns only a placeholder (![img-0.jpeg](img-0.jpeg)) for a raster
+# image embedded in a PDF page, without transcribing the text inside it. When
+# enabled, the extracted images are requested and OCR'd separately, and the
+# recognized text replaces the placeholder. Every image costs one extra OCR page.
+MISTRAL_OCR_EMBEDDED_IMAGES = (
+    get_env_variable("MISTRAL_OCR_EMBEDDED_IMAGES", "True").lower() == "true"
+)
+# Smallest image side (pixels) Mistral extracts, so logos/icons aren't OCR'd.
+MISTRAL_OCR_IMAGE_MIN_SIZE = max(
+    0, int(get_env_variable("MISTRAL_OCR_IMAGE_MIN_SIZE", "100"))
+)
+# Max embedded images Mistral extracts per document (minimum 1), before any
+# filtering. This bounds the size of the OCR response; images beyond it are not
+# extracted at all.
+MISTRAL_OCR_MAX_EXTRACTED_IMAGES = max(
+    1, int(get_env_variable("MISTRAL_OCR_MAX_EXTRACTED_IMAGES", "200"))
+)
+# Max distinct embedded images OCR'd per document (minimum 1), counted after the
+# page-fraction filter and the dedupe. Each one is a billed OCR call.
+MISTRAL_OCR_MAX_EMBEDDED_IMAGES = max(
+    1, int(get_env_variable("MISTRAL_OCR_MAX_EMBEDDED_IMAGES", "50"))
+)
+# Embedded images covering less than this fraction of their page (0-1) are not
+# OCR'd, so letterheads and logos repeated on every page cost nothing. 0 disables.
+# Applied before MISTRAL_OCR_MAX_EMBEDDED_IMAGES, so skipped images don't count.
+MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION = min(
+    1.0,
+    max(0.0, float(get_env_variable("MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION", "0.1"))),
+)
+# Max embedded-image OCR calls in flight at once across all documents and
+# requests (minimum 1); also the parallelism within a single document.
+MISTRAL_OCR_IMAGE_CONCURRENCY = max(
+    1, int(get_env_variable("MISTRAL_OCR_IMAGE_CONCURRENCY", "4"))
+)
 
 # DOCX handling for the /text endpoint: when enabled, .docx files are converted
 # via pandoc so tracked changes and comments are preserved (the embedding path
