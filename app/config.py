@@ -235,9 +235,16 @@ MISTRAL_OCR_EMBEDDED_IMAGES = (
 MISTRAL_OCR_IMAGE_MIN_SIZE = max(
     0, int(get_env_variable("MISTRAL_OCR_IMAGE_MIN_SIZE", "100"))
 )
-# Max embedded images extracted (and OCR'd) per document; <= 0 means no cap.
-MISTRAL_OCR_MAX_EMBEDDED_IMAGES = int(
-    get_env_variable("MISTRAL_OCR_MAX_EMBEDDED_IMAGES", "50")
+# Max embedded images extracted (and OCR'd) per document (minimum 1), which also
+# bounds the size of the OCR response.
+MISTRAL_OCR_MAX_EMBEDDED_IMAGES = max(
+    1, int(get_env_variable("MISTRAL_OCR_MAX_EMBEDDED_IMAGES", "50"))
+)
+# Embedded images covering less than this fraction of their page (0-1) are not
+# OCR'd, so letterheads and logos repeated on every page cost nothing. 0 disables.
+MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION = min(
+    1.0,
+    max(0.0, float(get_env_variable("MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION", "0.1"))),
 )
 # Number of embedded images OCR'd in parallel (minimum 1).
 MISTRAL_OCR_IMAGE_CONCURRENCY = max(
