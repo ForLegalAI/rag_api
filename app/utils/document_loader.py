@@ -6,6 +6,7 @@ import hashlib
 import mimetypes
 import re
 import tempfile
+import threading
 
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator, List, Optional
@@ -23,6 +24,7 @@ from app.config import (
     MISTRAL_OCR_EMBEDDED_IMAGES,
     MISTRAL_OCR_IMAGE_MIN_SIZE,
     MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION,
+    MISTRAL_OCR_MAX_EXTRACTED_IMAGES,
     MISTRAL_OCR_MAX_EMBEDDED_IMAGES,
     MISTRAL_OCR_IMAGE_CONCURRENCY,
     DOCX_TEXT_USE_PANDOC,
@@ -369,6 +371,7 @@ def _ocr_pages(client, document_payload: dict, include_image_base64: bool = Fals
         model=MISTRAL_OCR_MODEL,
         document=document_payload,
         include_image_base64=include_image_base64,
+        include_blocks=False,  # paragraph bounding boxes are unused; keep responses small
         retries=_ocr_retries(),
         **request_kwargs,
     )
@@ -396,6 +399,10 @@ def _image_data_uri(image_id: str, image_base64: str) -> str:
     return f"data:{mime};base64,{image_base64}"
 
 
+# Bounds embedded-image OCR calls in flight across all documents and requests.
+_IMAGE_OCR_SLOTS = threading.BoundedSemaphore(MISTRAL_OCR_IMAGE_CONCURRENCY)
+
+
 def _ocr_embedded_image(client, image_id: str, image_base64: str, source: str) -> str:
     """OCR one embedded image and return its text, or "" if there is none or the call fails.
 
@@ -403,7 +410,8 @@ def _ocr_embedded_image(client, image_id: str, image_base64: str, source: str) -
     """
     data_uri = _image_data_uri(image_id, image_base64)
     try:
-        pages = _ocr_pages(client, {"type": "image_url", "image_url": data_uri})
+        with _IMAGE_OCR_SLOTS:
+            pages = _ocr_pages(client, {"type": "image_url", "image_url": data_uri})
     except Exception as e:
         logger.warning(
             "OCR of embedded image %s in %s failed; keeping placeholder: %s",
@@ -419,13 +427,33 @@ def _ocr_embedded_image(client, image_id: str, image_base64: str, source: str) -
     return text.strip()
 
 
+# What may precede a placeholder that still stands alone on its line: indentation
+# and one markdown block marker (heading, bullet, quote or ordered-list number).
+_BLOCK_MARKER_PREFIX_RE = re.compile(r"[ \t]*(?:(?:#{1,6}|[-*+>]|\d+[.)])[ \t]+)?")
+
+
+def _replace_line(markdown: str, line_start: int, line_end: int, text: str) -> str:
+    """Replace a whole line with ``text`` as its own paragraph (or drop it if ``text`` is empty).
+
+    Adjacent newlines are folded into one blank line of separation; the rest of
+    the page is untouched.
+    """
+    while line_start > 0 and markdown[line_start - 1] == "\n":
+        line_start -= 1
+    while line_end < len(markdown) and markdown[line_end] == "\n":
+        line_end += 1
+    parts = (markdown[:line_start], text, markdown[line_end:])
+    return "\n\n".join(part for part in parts if part)
+
+
 def _replace_placeholder(markdown: str, image_id: str, text: str) -> str:
     """Swap the image's placeholder (``![alt](id)``) for ``text``; append it if there is none.
 
-    A placeholder alone on its line becomes its own paragraph: adjacent newlines
-    are folded into one blank line of separation and the rest of the page is
-    untouched. Elsewhere (a table cell, list item or sentence) the text goes
-    inline with its newlines collapsed, and ``|`` escaped inside a table row.
+    A placeholder alone on its line (optionally behind a markdown block marker
+    such as ``#``, ``-``, ``>`` or ``1.``) becomes its own paragraph, dropping
+    the marker. Elsewhere (a table cell or a sentence) the text goes inline with
+    its newlines collapsed, and ``|`` escaped inside a table row. The text goes
+    at the first occurrence only; repeated placeholders of the same image are removed.
     """
     pattern = re.compile(rf"!\[[^\]]*\]\({re.escape(image_id)}\)")
     matches = list(pattern.finditer(markdown))
@@ -433,23 +461,22 @@ def _replace_placeholder(markdown: str, image_id: str, text: str) -> str:
         return f"{markdown.rstrip()}\n\n{text}" if markdown.strip() else text
 
     inline_text = re.sub(r"\s*\n\s*", " ", text)
-    for match in reversed(matches):  # later first, so earlier offsets stay valid
-        start, end = match.span()
+    for index in reversed(range(len(matches))):  # later first, so earlier offsets stay valid
+        start, end = matches[index].span()
         line_start = markdown.rfind("\n", 0, start) + 1
         line_end = markdown.find("\n", end)
         line_end = len(markdown) if line_end == -1 else line_end
-        if markdown[line_start:start].strip() or markdown[end:line_end].strip():
+        keep_text = index == 0
+        if _BLOCK_MARKER_PREFIX_RE.fullmatch(markdown[line_start:start]) and not markdown[end:line_end].strip():
+            markdown = _replace_line(markdown, line_start, line_end, text if keep_text else "")
+            continue
+        replacement = ""
+        if keep_text:
             is_table_row = markdown[line_start:line_end].lstrip().startswith("|")
             replacement = inline_text.replace("|", "\\|") if is_table_row else inline_text
-            markdown = markdown[:start] + replacement + markdown[end:]
-            continue
-        while line_start > 0 and markdown[line_start - 1] == "\n":
-            line_start -= 1
-        while line_end < len(markdown) and markdown[line_end] == "\n":
-            line_end += 1
-        lead = "\n\n" if line_start > 0 else ""
-        trail = "\n\n" if line_end < len(markdown) else ""
-        markdown = markdown[:line_start] + lead + text + trail + markdown[line_end:]
+        elif markdown[start - 1 : start] in (" ", "\t") and markdown[end : end + 1] in (" ", "\t"):
+            end += 1  # don't leave a double space where the placeholder was
+        markdown = markdown[:start] + replacement + markdown[end:]
     return markdown
 
 
@@ -457,15 +484,15 @@ def _is_number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _below_min_page_fraction(image, page) -> bool:
-    """Whether ``image`` covers less of ``page`` than MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION.
+def _page_fraction(image, page):
+    """``(fraction, fits)``: the share of ``page`` that ``image`` covers, and whether its box lies on the page.
 
     The bounding box and the page dimensions are both taken to be in the pixel
-    space of the rendered page (UNVERIFIED against the live API). Images are kept
-    whenever the fraction can't be computed (missing coordinates or dimensions).
+    space of the rendered page (UNVERIFIED against the live API). ``fraction`` is
+    None when it can't be computed (missing coordinates or dimensions). ``fits``
+    is False when the box extends beyond the page (with 1% tolerance), which
+    suggests the two are in different units.
     """
-    if MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION <= 0:
-        return False
     dimensions = _field(page, "dimensions")
     page_width, page_height = _field(dimensions, "width"), _field(dimensions, "height")
     corners = [
@@ -473,20 +500,56 @@ def _below_min_page_fraction(image, page) -> bool:
         for name in ("top_left_x", "top_left_y", "bottom_right_x", "bottom_right_y")
     ]
     if not all(_is_number(v) for v in [page_width, page_height, *corners]):
-        return False
+        return None, True
     left, top, right, bottom = corners
     if page_width <= 0 or page_height <= 0 or right <= left or bottom <= top:
-        return False
-    page_area = page_width * page_height
-    return (right - left) * (bottom - top) < MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION * page_area
+        return None, True
+    if right > page_width * 1.01 or bottom > page_height * 1.01:
+        return None, False
+    return (right - left) * (bottom - top) / (page_width * page_height), True
+
+
+def _drop_small_images(found: list, source: str) -> list:
+    """Drop images covering less than MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION of their page.
+
+    ``found`` holds ``(page position, page, image, image id, image base64)``.
+    Images whose box doesn't fit their page are kept: the filter can't be trusted
+    for them.
+    """
+    if MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION <= 0:
+        return found
+    kept = []
+    units_warned = False
+    for entry in found:
+        position, page, image, image_id, _ = entry
+        fraction, fits = _page_fraction(image, page)
+        if not fits and not units_warned:
+            units_warned = True
+            logger.warning(
+                "Embedded image %s in %s has a bounding box outside its page; "
+                "page coordinates may be in other units, so such images are not filtered by size",
+                image_id,
+                source,
+            )
+        if fraction is not None and fraction < MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION:
+            logger.debug(
+                "Skipping embedded image %s on page %d of %s: covers %.1f%% of the page",
+                image_id,
+                position + 1,
+                source,
+                fraction * 100,
+            )
+            continue
+        kept.append(entry)
+    return kept
 
 
 def _collect_embedded_images(pages: list, source: str) -> list:
     """Embedded images worth OCR'ing as ``(page position, image id, image base64)``.
 
-    Mistral is asked for one image more than MISTRAL_OCR_MAX_EMBEDDED_IMAGES, so
-    receiving more than the cap means the document has images beyond it; those
-    are dropped with a warning. Images too small relative to their page are skipped.
+    Mistral is asked for one image more than MISTRAL_OCR_MAX_EXTRACTED_IMAGES, so
+    receiving more than that means the document has images beyond it; those are
+    dropped with a warning. Images too small relative to their page are skipped.
     """
     found = []  # (page position, page, image, image id, image base64)
     for position, page in enumerate(pages):
@@ -496,17 +559,16 @@ def _collect_embedded_images(pages: list, source: str) -> list:
             if isinstance(image_id, str) and isinstance(image_base64, str) and image_base64:
                 found.append((position, page, image, image_id, image_base64))
 
-    if len(found) > MISTRAL_OCR_MAX_EMBEDDED_IMAGES:
+    if len(found) > MISTRAL_OCR_MAX_EXTRACTED_IMAGES:
         logger.warning(
-            "%s has more than MISTRAL_OCR_MAX_EMBEDDED_IMAGES=%d embedded images; the rest keep their placeholders",
+            "%s has more than MISTRAL_OCR_MAX_EXTRACTED_IMAGES=%d embedded images; later images were not extracted",
             source,
-            MISTRAL_OCR_MAX_EMBEDDED_IMAGES,
+            MISTRAL_OCR_MAX_EXTRACTED_IMAGES,
         )
-        found = found[:MISTRAL_OCR_MAX_EMBEDDED_IMAGES]
+        found = found[:MISTRAL_OCR_MAX_EXTRACTED_IMAGES]
     return [
         (position, image_id, image_base64)
-        for position, page, image, image_id, image_base64 in found
-        if not _below_min_page_fraction(image, page)
+        for position, _, _, image_id, image_base64 in _drop_small_images(found, source)
     ]
 
 
@@ -515,16 +577,25 @@ def _inline_embedded_images(client, pages: list, markdowns: List[str], source: s
 
     Image ids repeat across pages (``img-0.jpeg`` on each), so images are matched
     to their own page. Identical images (a logo on every page) are OCR'd once and
-    their text reused. Images are OCR'd concurrently but applied in page order, so
-    the result doesn't depend on which call finishes first.
+    their text reused; at most MISTRAL_OCR_MAX_EMBEDDED_IMAGES distinct images are
+    OCR'd, in page order. Images are OCR'd concurrently but applied in page order,
+    so the result doesn't depend on which call finishes first.
     """
-    placements = []  # (page position, image id, content digest)
+    placements = {}  # (page position, image id) -> content digest
     distinct = {}  # content digest -> (image id, image base64) of its first occurrence
     for position, image_id, image_base64 in _collect_embedded_images(pages, source):
         digest = hashlib.sha256(image_base64.encode()).hexdigest()
         distinct.setdefault(digest, (image_id, image_base64))
-        placements.append((position, image_id, digest))
-    if not placements:
+        placements.setdefault((position, image_id), digest)
+
+    if len(distinct) > MISTRAL_OCR_MAX_EMBEDDED_IMAGES:
+        logger.warning(
+            "%s has more than MISTRAL_OCR_MAX_EMBEDDED_IMAGES=%d distinct embedded images; the rest keep their placeholders",
+            source,
+            MISTRAL_OCR_MAX_EMBEDDED_IMAGES,
+        )
+        distinct = dict(list(distinct.items())[:MISTRAL_OCR_MAX_EMBEDDED_IMAGES])
+    if not distinct:
         return markdowns
 
     with ThreadPoolExecutor(max_workers=MISTRAL_OCR_IMAGE_CONCURRENCY) as executor:
@@ -535,8 +606,8 @@ def _inline_embedded_images(client, pages: list, markdowns: List[str], source: s
         texts = dict(zip(distinct, results))
 
     result = list(markdowns)
-    for position, image_id, digest in placements:
-        if texts[digest]:
+    for (position, image_id), digest in placements.items():
+        if texts.get(digest):  # absent when the image was over the OCR cap
             result[position] = _replace_placeholder(result[position], image_id, texts[digest])
     return result
 
@@ -564,7 +635,7 @@ def _ocr_document(
             "include_image_base64": True,
             "image_min_size": MISTRAL_OCR_IMAGE_MIN_SIZE,
             # One more than the cap, so exceeding it is detectable.
-            "image_limit": MISTRAL_OCR_MAX_EMBEDDED_IMAGES + 1,
+            "image_limit": MISTRAL_OCR_MAX_EXTRACTED_IMAGES + 1,
         }
 
     try:
