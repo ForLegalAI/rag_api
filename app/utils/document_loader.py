@@ -2,9 +2,13 @@
 
 import os
 import codecs
+import hashlib
+import mimetypes
 import re
 import tempfile
+import threading
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator, List, Optional
 import chardet
 
@@ -17,6 +21,12 @@ from app.config import (
     MISTRAL_API_KEY,
     MISTRAL_OCR_MODEL,
     MISTRAL_SERVER_URL,
+    MISTRAL_OCR_EMBEDDED_IMAGES,
+    MISTRAL_OCR_IMAGE_MIN_SIZE,
+    MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION,
+    MISTRAL_OCR_MAX_EXTRACTED_IMAGES,
+    MISTRAL_OCR_MAX_EMBEDDED_IMAGES,
+    MISTRAL_OCR_IMAGE_CONCURRENCY,
     DOCX_TEXT_USE_PANDOC,
     DOCX_TEXT_TRACK_CHANGES,
     DOCX_TEXT_INCLUDE_HEADERS_FOOTERS,
@@ -328,45 +338,326 @@ def _mistral_ocr_client():
     return Mistral(api_key=MISTRAL_API_KEY)
 
 
-def _ocr_document(client, document_payload: dict, source: str, start_page: int = 1) -> List[Document]:
+def _field(obj, name: str):
+    """Read ``name`` from an SDK model or a dict-like response object."""
+    return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+
+def _ocr_retries():
+    """Retry policy for every OCR call.
+
+    The SDK retries HTTP 429/500/502/503/504 (its per-operation default for
+    ``ocr.process``) and connection errors, with exponential backoff that honors
+    a ``Retry-After`` header.
+    """
+    from mistralai.client import utils
+
+    return utils.RetryConfig(
+        "backoff",
+        utils.BackoffStrategy(
+            initial_interval=500, max_interval=10_000, exponent=1.5, max_elapsed_time=60_000
+        ),
+        retry_connection_errors=True,
+    )
+
+
+def _ocr_pages(client, document_payload: dict, include_image_base64: bool = False, **request_kwargs) -> list:
+    """Run one Mistral OCR request and return the raw response pages (possibly empty).
+
+    Transient failures are retried (see :func:`_ocr_retries`); other errors
+    propagate unlogged, as each caller decides how severe a failure is.
+    """
+    ocr_response = client.ocr.process(
+        model=MISTRAL_OCR_MODEL,
+        document=document_payload,
+        include_image_base64=include_image_base64,
+        include_blocks=False,  # paragraph bounding boxes are unused; keep responses small
+        retries=_ocr_retries(),
+        **request_kwargs,
+    )
+    pages = _field(ocr_response, "pages")
+    return list(pages) if pages else []
+
+
+def _page_markdowns(pages: list) -> List[str]:
+    """Markdown of each response page ("" when a page has none)."""
+    return [_field(page, "markdown") or "" for page in pages]
+
+
+# Markdown image syntax (``![alt](target)``) — what OCR leaves for pictures and
+# tables it did not transcribe.
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+
+
+def _image_data_uri(image_id: str, image_base64: str) -> str:
+    """Return ``image_base64`` as a data URI, deriving the mime from the image id if bare."""
+    if image_base64.startswith("data:"):
+        return image_base64
+    mime = mimetypes.guess_type(image_id)[0]
+    if not mime or not mime.startswith("image/"):
+        mime = "image/jpeg"
+    return f"data:{mime};base64,{image_base64}"
+
+
+# Bounds embedded-image OCR calls in flight across all documents and requests.
+_IMAGE_OCR_SLOTS = threading.BoundedSemaphore(MISTRAL_OCR_IMAGE_CONCURRENCY)
+
+
+def _ocr_embedded_image(client, image_id: str, image_base64: str, source: str) -> str:
+    """OCR one embedded image and return its text, or "" if there is none or the call fails.
+
+    A failure only costs this image's text (its placeholder is kept), never the document.
+    """
+    data_uri = _image_data_uri(image_id, image_base64)
+    try:
+        with _IMAGE_OCR_SLOTS:
+            pages = _ocr_pages(client, {"type": "image_url", "image_url": data_uri})
+    except Exception as e:
+        logger.warning(
+            "OCR of embedded image %s in %s failed; keeping placeholder: %s",
+            image_id,
+            source,
+            e,
+        )
+        return ""
+
+    text = "\n\n".join(
+        _MARKDOWN_IMAGE_RE.sub("", md).strip() for md in _page_markdowns(pages)
+    )
+    return text.strip()
+
+
+# What may precede a placeholder that still stands alone on its line: indentation
+# and one markdown block marker (heading, bullet, quote or ordered-list number).
+_BLOCK_MARKER_PREFIX_RE = re.compile(r"[ \t]*(?:(?:#{1,6}|[-*+>]|\d+[.)])[ \t]+)?")
+
+
+def _replace_line(markdown: str, line_start: int, line_end: int, text: str) -> str:
+    """Replace a whole line with ``text`` as its own paragraph (or drop it if ``text`` is empty).
+
+    Adjacent newlines are folded into one blank line of separation; the rest of
+    the page is untouched.
+    """
+    while line_start > 0 and markdown[line_start - 1] == "\n":
+        line_start -= 1
+    while line_end < len(markdown) and markdown[line_end] == "\n":
+        line_end += 1
+    parts = (markdown[:line_start], text, markdown[line_end:])
+    return "\n\n".join(part for part in parts if part)
+
+
+def _replace_placeholder(markdown: str, image_id: str, text: str) -> str:
+    """Swap the image's placeholder (``![alt](id)``) for ``text``; append it if there is none.
+
+    A placeholder alone on its line (optionally behind a markdown block marker
+    such as ``#``, ``-``, ``>`` or ``1.``) becomes its own paragraph, dropping
+    the marker. Elsewhere (a table cell or a sentence) the text goes inline with
+    its newlines collapsed, and ``|`` escaped inside a table row. The text goes
+    at the first occurrence only; repeated placeholders of the same image are removed.
+    """
+    pattern = re.compile(rf"!\[[^\]]*\]\({re.escape(image_id)}\)")
+    matches = list(pattern.finditer(markdown))
+    if not matches:
+        return f"{markdown.rstrip()}\n\n{text}" if markdown.strip() else text
+
+    inline_text = re.sub(r"\s*\n\s*", " ", text)
+    for index in reversed(range(len(matches))):  # later first, so earlier offsets stay valid
+        start, end = matches[index].span()
+        line_start = markdown.rfind("\n", 0, start) + 1
+        line_end = markdown.find("\n", end)
+        line_end = len(markdown) if line_end == -1 else line_end
+        keep_text = index == 0
+        if _BLOCK_MARKER_PREFIX_RE.fullmatch(markdown[line_start:start]) and not markdown[end:line_end].strip():
+            markdown = _replace_line(markdown, line_start, line_end, text if keep_text else "")
+            continue
+        replacement = ""
+        if keep_text:
+            is_table_row = markdown[line_start:line_end].lstrip().startswith("|")
+            replacement = inline_text.replace("|", "\\|") if is_table_row else inline_text
+        elif markdown[start - 1 : start] in (" ", "\t") and markdown[end : end + 1] in (" ", "\t"):
+            end += 1  # don't leave a double space where the placeholder was
+        markdown = markdown[:start] + replacement + markdown[end:]
+    return markdown
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _page_fraction(image, page):
+    """``(fraction, fits)``: the share of ``page`` that ``image`` covers, and whether its box lies on the page.
+
+    The bounding box and the page dimensions are both taken to be in the pixel
+    space of the rendered page (UNVERIFIED against the live API). ``fraction`` is
+    None when it can't be computed (missing coordinates or dimensions). ``fits``
+    is False when the box extends beyond the page (with 1% tolerance), which
+    suggests the two are in different units.
+    """
+    dimensions = _field(page, "dimensions")
+    page_width, page_height = _field(dimensions, "width"), _field(dimensions, "height")
+    corners = [
+        _field(image, name)
+        for name in ("top_left_x", "top_left_y", "bottom_right_x", "bottom_right_y")
+    ]
+    if not all(_is_number(v) for v in [page_width, page_height, *corners]):
+        return None, True
+    left, top, right, bottom = corners
+    if page_width <= 0 or page_height <= 0 or right <= left or bottom <= top:
+        return None, True
+    if right > page_width * 1.01 or bottom > page_height * 1.01:
+        return None, False
+    return (right - left) * (bottom - top) / (page_width * page_height), True
+
+
+def _drop_small_images(found: list, source: str) -> list:
+    """Drop images covering less than MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION of their page.
+
+    ``found`` holds ``(page position, page, image, image id, image base64)``.
+    Images whose box doesn't fit their page are kept: the filter can't be trusted
+    for them.
+    """
+    if MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION <= 0:
+        return found
+    kept = []
+    units_warned = False
+    for entry in found:
+        position, page, image, image_id, _ = entry
+        fraction, fits = _page_fraction(image, page)
+        if not fits and not units_warned:
+            units_warned = True
+            logger.warning(
+                "Embedded image %s in %s has a bounding box outside its page; "
+                "page coordinates may be in other units, so such images are not filtered by size",
+                image_id,
+                source,
+            )
+        if fraction is not None and fraction < MISTRAL_OCR_IMAGE_MIN_PAGE_FRACTION:
+            logger.debug(
+                "Skipping embedded image %s on page %d of %s: covers %.1f%% of the page",
+                image_id,
+                position + 1,
+                source,
+                fraction * 100,
+            )
+            continue
+        kept.append(entry)
+    return kept
+
+
+def _collect_embedded_images(pages: list, source: str) -> list:
+    """Embedded images worth OCR'ing as ``(page position, image id, image base64)``.
+
+    Mistral is asked for one image more than MISTRAL_OCR_MAX_EXTRACTED_IMAGES, so
+    receiving more than that means the document has images beyond it; those are
+    dropped with a warning. Images too small relative to their page are skipped.
+    """
+    found = []  # (page position, page, image, image id, image base64)
+    for position, page in enumerate(pages):
+        for image in _field(page, "images") or []:
+            image_id = _field(image, "id")
+            image_base64 = _field(image, "image_base64")
+            if isinstance(image_id, str) and isinstance(image_base64, str) and image_base64:
+                found.append((position, page, image, image_id, image_base64))
+
+    if len(found) > MISTRAL_OCR_MAX_EXTRACTED_IMAGES:
+        logger.warning(
+            "%s has more than MISTRAL_OCR_MAX_EXTRACTED_IMAGES=%d embedded images; later images were not extracted",
+            source,
+            MISTRAL_OCR_MAX_EXTRACTED_IMAGES,
+        )
+        found = found[:MISTRAL_OCR_MAX_EXTRACTED_IMAGES]
+    return [
+        (position, image_id, image_base64)
+        for position, _, _, image_id, image_base64 in _drop_small_images(found, source)
+    ]
+
+
+def _inline_embedded_images(client, pages: list, markdowns: List[str], source: str) -> List[str]:
+    """Return per-page markdown with embedded images' OCR text in place of their placeholders.
+
+    Image ids repeat across pages (``img-0.jpeg`` on each), so images are matched
+    to their own page. Identical images (a logo on every page) are OCR'd once and
+    their text reused; at most MISTRAL_OCR_MAX_EMBEDDED_IMAGES distinct images are
+    OCR'd, in page order. Images are OCR'd concurrently but applied in page order,
+    so the result doesn't depend on which call finishes first.
+    """
+    placements = {}  # (page position, image id) -> content digest
+    distinct = {}  # content digest -> (image id, image base64) of its first occurrence
+    for position, image_id, image_base64 in _collect_embedded_images(pages, source):
+        digest = hashlib.sha256(image_base64.encode()).hexdigest()
+        distinct.setdefault(digest, (image_id, image_base64))
+        placements.setdefault((position, image_id), digest)
+
+    if len(distinct) > MISTRAL_OCR_MAX_EMBEDDED_IMAGES:
+        logger.warning(
+            "%s has more than MISTRAL_OCR_MAX_EMBEDDED_IMAGES=%d distinct embedded images; the rest keep their placeholders",
+            source,
+            MISTRAL_OCR_MAX_EMBEDDED_IMAGES,
+        )
+        distinct = dict(list(distinct.items())[:MISTRAL_OCR_MAX_EMBEDDED_IMAGES])
+    if not distinct:
+        return markdowns
+
+    with ThreadPoolExecutor(max_workers=MISTRAL_OCR_IMAGE_CONCURRENCY) as executor:
+        results = executor.map(
+            lambda image: _ocr_embedded_image(client, image[0], image[1], source),
+            distinct.values(),
+        )
+        texts = dict(zip(distinct, results))
+
+    result = list(markdowns)
+    for (position, image_id), digest in placements.items():
+        if texts.get(digest):  # absent when the image was over the OCR cap
+            result[position] = _replace_placeholder(result[position], image_id, texts[digest])
+    return result
+
+
+def _ocr_document(
+    client,
+    document_payload: dict,
+    source: str,
+    start_page: int = 1,
+    embedded_images: bool = False,
+) -> List[Document]:
     """Run one Mistral OCR request and map its pages to Documents.
 
     Pages are numbered sequentially (1-based) from ``start_page`` in response
     order, so callers don't depend on the provider's own (0-based) page index.
     Returns a single empty placeholder when the response has no pages.
+
+    With ``embedded_images``, the images Mistral extracts from the document are
+    OCR'd separately and their text is inlined where the page markdown only has
+    an image placeholder.
     """
+    request_kwargs = {}
+    if embedded_images:
+        request_kwargs = {
+            "include_image_base64": True,
+            "image_min_size": MISTRAL_OCR_IMAGE_MIN_SIZE,
+            # One more than the cap, so exceeding it is detectable.
+            "image_limit": MISTRAL_OCR_MAX_EXTRACTED_IMAGES + 1,
+        }
+
     try:
-        ocr_response = client.ocr.process(
-            model=MISTRAL_OCR_MODEL,
-            document=document_payload,
-            include_image_base64=False,
-        )
+        pages = _ocr_pages(client, document_payload, **request_kwargs)
     except Exception as e:
         logger.error(f"Mistral OCR API call failed: {e}")
         raise
-
-    pages = getattr(ocr_response, "pages", None)
-    # Some clients return dict-like response; handle both
-    if pages is None and isinstance(ocr_response, dict):
-        pages = ocr_response.get("pages")
-
     if not pages:
         # Return an empty single document to avoid downstream crashes
         return [Document(page_content="", metadata={"source": source, "page": start_page})]
 
-    documents: List[Document] = []
-    for offset, page in enumerate(pages):
-        markdown = (
-            page.get("markdown") if isinstance(page, dict) else getattr(page, "markdown", None)
-        )
-        documents.append(
-            Document(
-                page_content=markdown or "",
-                metadata={"source": source, "page": start_page + offset},
-            )
-        )
+    markdowns = _page_markdowns(pages)
+    if embedded_images:
+        markdowns = _inline_embedded_images(client, pages, markdowns, source)
 
-    return documents
+    return [
+        Document(
+            page_content=markdown,
+            metadata={"source": source, "page": start_page + offset},
+        )
+        for offset, markdown in enumerate(markdowns)
+    ]
 
 
 class SafePyPDFLoader:
@@ -378,7 +669,9 @@ class SafePyPDFLoader:
     - metadata.source: original filepath
     - metadata.page: 1-based page index
 
-    Images embedded in the PDF are not extracted.
+    Mistral OCR leaves only a placeholder for a raster image embedded in a page
+    (e.g. a photo of a document). With ``MISTRAL_OCR_EMBEDDED_IMAGES`` enabled,
+    those images are OCR'd separately and their text replaces the placeholder.
     """
 
     def __init__(self, filepath: str):
@@ -397,7 +690,9 @@ class SafePyPDFLoader:
             "type": "document_url",
             "document_url": f"data:application/pdf;base64,{self._encode_pdf_b64()}",
         }
-        return _ocr_document(client, payload, self.filepath)
+        return _ocr_document(
+            client, payload, self.filepath, embedded_images=MISTRAL_OCR_EMBEDDED_IMAGES
+        )
 
     def lazy_load(self) -> Iterator[Document]:
         """Yield OCR-extracted pages one at a time.
