@@ -15,6 +15,7 @@ uvicorn==0.54.0
 unstructured==0.27.34
 # unstructured >=0.24 lazily downloads this spaCy model from GitHub on first use; install it at build time instead (same pin/hash unstructured 0.27.34 expects).
 en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85
+preshed==3.0.13  # 3.0.14 breaks loading en_core_web_sm under spaCy 3.8.16 (OverflowError in Tokenizer._flush_specials)
 markdown==3.11.2
 pandas==2.3.3
 openpyxl==3.1.5
