@@ -133,6 +133,21 @@ def override_vector_store(monkeypatch):
     monkeypatch.setattr(AsyncPgVector, "delete_scoped", dummy_delete_scoped)
 
 
+# Ported from upstream (danny-avila/rag_api#346). Older Starlette (this test fails on
+# 1.0.0 and passes from 1.3.0) built request.url from the raw Host header, so
+# "Host: testserver/health?" made /ids look like /health to the public-path check in
+# app/middleware.py and skipped authentication. FastAPI only requires starlette>=0.46,
+# so the explicit starlette pin in requirements*.txt is what keeps this closed.
+@pytest.mark.parametrize("public_path", ["/health", "/docs", "/openapi.json"])
+def test_malformed_host_cannot_bypass_authentication(monkeypatch, public_path):
+    monkeypatch.setenv("JWT_SECRET", "testsecret")
+
+    response = client.get("/ids", headers={"Host": f"testserver{public_path}?"})
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Missing or invalid Authorization header"}
+
+
 def test_get_all_ids(auth_headers):
     response = client.get("/ids", headers=auth_headers)
     assert response.status_code == 200
