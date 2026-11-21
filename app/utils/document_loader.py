@@ -311,6 +311,88 @@ def process_documents(documents: List[Document]) -> str:
     return processed_text.strip()
 
 
+class OCRNotConfiguredError(RuntimeError):
+    """OCR can't run on this server (``mistralai`` missing or ``MISTRAL_API_KEY`` unset).
+
+    A server misconfiguration, not a problem with the uploaded file and not
+    something a retry fixes.
+    """
+
+
+# Upstream statuses worth retrying later: timeout, rate limit, and server errors (>= 500).
+_TRANSIENT_UPSTREAM_STATUSES = frozenset({408, 429})
+
+
+def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
+    """``exc`` and the exceptions it was raised from or during, outermost first.
+
+    Follows the chain Python would print: ``__cause__``, else ``__context__``
+    unless ``raise ... from None`` hid it.
+    """
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        if exc.__cause__ is not None:
+            exc = exc.__cause__
+        elif not exc.__suppress_context__:
+            exc = exc.__context__
+        else:
+            exc = None
+
+
+def _is_mistral_error(exc: BaseException) -> bool:
+    # By module rather than isinstance, so this works without importing the SDK.
+    return type(exc).__module__.startswith("mistralai")
+
+
+def classify_ocr_failure(exc: BaseException) -> Optional[tuple]:
+    """Map an extraction failure caused by the OCR service to ``(http_status, retry_after)``.
+
+    Returns None when the failure isn't the OCR service's (an unsupported,
+    encrypted or corrupt file, or any non-OCR error), so the caller keeps its
+    own status for it. Otherwise:
+
+    - 503 for transient failures, worth retrying later: Mistral rate limits
+      (429), timeouts (408) and server errors (5xx) left after the SDK's own
+      retries, no response, and network errors or timeouts reaching it.
+      ``retry_after`` is Mistral's ``Retry-After`` header when it sent one.
+    - 502 when Mistral rejects this server's credentials (401/403), or sends
+      a response the SDK can't use (a non-error status, e.g. a 200 whose body
+      fails validation).
+    - 500 when OCR isn't configured on this server (:class:`OCRNotConfiguredError`).
+
+    Other Mistral 4xx responses (e.g. 400/422 for a document it can't read)
+    return None: they are about the file. So do Mistral-module errors that are
+    neither HTTP errors nor ``NoResponseError``.
+    """
+    try:
+        import httpx
+    except Exception:  # pragma: no cover - httpx ships with mistralai
+        httpx = None
+
+    for error in _exception_chain(exc):
+        if isinstance(error, OCRNotConfiguredError):
+            return 500, None
+        if httpx is not None and isinstance(error, httpx.TransportError):
+            return 503, None  # includes timeouts and connection errors
+        if not _is_mistral_error(error):
+            continue
+        if type(error).__name__ == "NoResponseError":
+            return 503, None  # the request went out and nothing came back
+        status_code = getattr(error, "status_code", None)
+        if not isinstance(status_code, int):
+            return None
+        if status_code in _TRANSIENT_UPSTREAM_STATUSES or status_code >= 500:
+            headers = getattr(error, "headers", None)
+            retry_after = headers.get("retry-after") if headers is not None else None
+            return 503, retry_after
+        if status_code in (401, 403) or status_code < 400:
+            return 502, None
+        return None
+    return None
+
+
 def _mistral_ocr_client():
     """Import mistralai, validate the API key, and return a configured client.
 
@@ -321,12 +403,12 @@ def _mistral_ocr_client():
     try:
         from mistralai.client import Mistral
     except Exception as e:
-        raise RuntimeError(
+        raise OCRNotConfiguredError(
             "mistralai package is required for OCR. Please install 'mistralai>=2.0.0' and set MISTRAL_API_KEY."
         ) from e
 
     if not MISTRAL_API_KEY:
-        raise RuntimeError(
+        raise OCRNotConfiguredError(
             "MISTRAL_API_KEY is not set. Please configure it in environment variables."
         )
 

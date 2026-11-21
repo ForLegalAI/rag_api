@@ -95,6 +95,7 @@ from app.utils.async_utils import run_in_executor
 from app.utils.document_loader import (
     get_loader,
     clean_text,
+    classify_ocr_failure,
     process_documents,
     cleanup_temp_encoding_file,
 )
@@ -362,20 +363,44 @@ async def load_file_content(
             cleanup_temp_encoding_file(loader)
 
 
+def _document_text(doc: Document, file_ext: str) -> str:
+    """A loaded document's text as ``/text`` returns it (cleaned for PDFs)."""
+    return clean_text(doc.page_content) if file_ext == "pdf" else doc.page_content
+
+
 def extract_text_from_documents(documents: List[Document], file_ext: str) -> str:
     """Extract text content from loaded documents."""
     text_content = ""
     if documents:
         for doc in documents:
             if hasattr(doc, "page_content"):
-                # Clean text if it's a PDF
-                if file_ext == "pdf":
-                    text_content += clean_text(doc.page_content) + "\n"
-                else:
-                    text_content += doc.page_content + "\n"
+                text_content += _document_text(doc, file_ext) + "\n"
 
     # Remove trailing newline
     return text_content.rstrip("\n")
+
+
+def _page_number(doc: Document) -> Optional[int]:
+    page = getattr(doc, "metadata", {}).get("page")
+    return page if isinstance(page, int) and not isinstance(page, bool) else None
+
+
+def extract_pages_from_documents(documents: List[Document], file_ext: str) -> List[dict]:
+    """Per-page text for ``/text?pages=true``: ``[{"page": n, "text": ...}]`` in loader order.
+
+    Pages come from the loaders that produce them (PDF, standalone images and
+    multi-page TIFF), which set a 1-based ``metadata["page"]`` on every
+    Document. Formats without pages, i.e. any load where some Document lacks
+    an integer page, give ``[]``. Blank pages are kept with empty text, so the
+    numbering has no gaps. Each page's text is cleaned exactly as the joined
+    ``text`` is.
+    """
+    if not documents or any(_page_number(doc) is None for doc in documents):
+        return []
+    return [
+        {"page": _page_number(doc), "text": _document_text(doc, file_ext)}
+        for doc in documents
+    ]
 
 
 async def cleanup_temp_file_async(file_path: str) -> None:
@@ -1523,10 +1548,19 @@ async def extract_text_from_file(
     file_id: str = Form(...),
     file: UploadFile = File(...),
     entity_id: str = Form(None),
+    pages: bool = Form(False),
 ):
     """
     Extract text content from an uploaded file without creating embeddings.
     Returns the raw text content for text parsing purposes.
+
+    With ``pages=true`` the response also carries ``pages``, the text of each
+    page (see :func:`extract_pages_from_documents`); without it the response
+    is unchanged.
+
+    A failure of the OCR service answers 503 (try again later), 502 (it
+    rejected our credentials) or 500 (OCR not configured) instead of 400,
+    which stays for problems with the file itself.
     """
     user_id = get_user_id(request, entity_id)
     validated_temp_file_path = _make_unique_temp_path(user_id, file.filename)
@@ -1552,12 +1586,15 @@ async def extract_text_from_file(
         # Extract text content from loaded documents
         text_content = extract_text_from_documents(data, file_ext)
 
-        return {
+        response = {
             "text": text_content,
             "file_id": file_id,
             "filename": file.filename,
             "known_type": known_type,
         }
+        if pages:
+            response["pages"] = extract_pages_from_documents(data, file_ext)
+        return response
 
     except HTTPException as http_exc:
         logger.error(
@@ -1578,10 +1615,14 @@ async def extract_text_from_file(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=ERROR_MESSAGES.PANDOC_NOT_INSTALLED,
             )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Error during text extraction: {str(e)}",
-            )
+        # The detail stays the same whatever the status, so callers that match
+        # on it keep working.
+        ocr_failure = classify_ocr_failure(e)
+        status_code, retry_after = ocr_failure or (status.HTTP_400_BAD_REQUEST, None)
+        raise HTTPException(
+            status_code=status_code,
+            detail=f"Error during text extraction: {str(e)}",
+            headers={"Retry-After": retry_after} if retry_after else None,
+        )
     finally:
         await cleanup_temp_file_async(validated_temp_file_path)
