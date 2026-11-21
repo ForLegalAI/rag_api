@@ -267,7 +267,7 @@ Make sure to set these environment variables before running the application. You
 - **Per-page output:** send `pages=true` to also get `"pages": [{"page": 1, "text": "…"}, …]`, so callers can cite by page. Pages are 1-based and come from the loaders that have them: PDFs, standalone images, and multi-page TIFFs (one entry per frame). Each page's text is cleaned the same way as `text`, which is unchanged by the flag. Blank pages are **kept** with empty text, so the numbering has no gaps. For formats without pages (`.docx`, `.eml`, `.msg`, `.rtf`, `.xlsx`, `.pptx`, text files…), `pages` is `[]`; use `text`. Without the field the response has no `pages` key.
 - **Status codes:** `400` means a problem with the file itself (unsupported, encrypted, corrupt, or rejected by Mistral as unreadable). Failures of the OCR service get their own codes, with the same `detail` message as before:
     - `503`: transient, retry later. Mistral rate limits (429), timeouts (408) and server errors (5xx) left after the SDK's own retries, or Mistral unreachable or timing out. Mistral's `Retry-After` header is forwarded when it sends one.
-    - `502`: Mistral rejected this server's API key (401/403).
+    - `502`: Mistral rejected this server's API key (401/403), or sent a response the SDK could not use.
     - `500`: OCR is not configured on this server (`MISTRAL_API_KEY` unset).
 
 ### Embedding Batch Processing

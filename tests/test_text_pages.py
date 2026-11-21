@@ -14,7 +14,7 @@ import httpx
 import jwt
 import pytest
 from fastapi.testclient import TestClient
-from mistralai.client.errors import NoResponseError, SDKError
+from mistralai.client.errors import NoResponseError, ResponseValidationError, SDKError
 
 from app.utils import document_loader
 from main import app
@@ -238,3 +238,34 @@ def test_failure_wrapped_by_another_exception_is_still_classified():
             raise RuntimeError("load failed") from inner
     except RuntimeError as outer:
         assert document_loader.classify_ocr_failure(outer) == (503, None)
+
+
+def test_failure_hidden_with_from_none_is_not_classified():
+    """``raise ... from None`` hides the context, so a file error isn't blamed on OCR."""
+    try:
+        try:
+            raise _upstream_error(429)
+        except SDKError:
+            raise ValueError("file is corrupt") from None
+    except ValueError as outer:
+        assert document_loader.classify_ocr_failure(outer) is None
+
+
+def test_unusable_upstream_response_answers_502(ocr, pdf_file, auth_headers):
+    """A 200 the SDK can't parse is Mistral's fault, not the file's."""
+    response_200 = httpx.Response(200, request=httpx.Request("POST", "https://api.mistral.ai/v1/ocr"))
+    ocr.ocr.process.side_effect = ResponseValidationError(
+        "Response validation failed", response_200, ValueError("bad schema")
+    )
+
+    response = _post_text(pdf_file, "contract.pdf", "application/pdf", auth_headers)
+
+    assert response.status_code == 502
+
+
+def test_mistral_error_without_status_is_not_transient():
+    class LocalSDKFailure(Exception):
+        pass
+
+    LocalSDKFailure.__module__ = "mistralai.client.utils"
+    assert document_loader.classify_ocr_failure(LocalSDKFailure("bad request payload")) is None

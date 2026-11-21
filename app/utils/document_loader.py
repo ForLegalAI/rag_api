@@ -324,12 +324,21 @@ _TRANSIENT_UPSTREAM_STATUSES = frozenset({408, 429})
 
 
 def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
-    """``exc`` and the exceptions it was raised from or during, outermost first."""
+    """``exc`` and the exceptions it was raised from or during, outermost first.
+
+    Follows the chain Python would print: ``__cause__``, else ``__context__``
+    unless ``raise ... from None`` hid it.
+    """
     seen = set()
     while exc is not None and id(exc) not in seen:
         seen.add(id(exc))
         yield exc
-        exc = exc.__cause__ or exc.__context__
+        if exc.__cause__ is not None:
+            exc = exc.__cause__
+        elif not exc.__suppress_context__:
+            exc = exc.__context__
+        else:
+            exc = None
 
 
 def _is_mistral_error(exc: BaseException) -> bool:
@@ -348,11 +357,14 @@ def classify_ocr_failure(exc: BaseException) -> Optional[tuple]:
       (429), timeouts (408) and server errors (5xx) left after the SDK's own
       retries, no response, and network errors or timeouts reaching it.
       ``retry_after`` is Mistral's ``Retry-After`` header when it sent one.
-    - 502 when Mistral rejects this server's credentials (401/403).
+    - 502 when Mistral rejects this server's credentials (401/403), or sends
+      a response the SDK can't use (a non-error status, e.g. a 200 whose body
+      fails validation).
     - 500 when OCR isn't configured on this server (:class:`OCRNotConfiguredError`).
 
     Other Mistral 4xx responses (e.g. 400/422 for a document it can't read)
-    return None: they are about the file.
+    return None: they are about the file. So do Mistral-module errors that are
+    neither HTTP errors nor ``NoResponseError``.
     """
     try:
         import httpx
@@ -366,14 +378,16 @@ def classify_ocr_failure(exc: BaseException) -> Optional[tuple]:
             return 503, None  # includes timeouts and connection errors
         if not _is_mistral_error(error):
             continue
+        if type(error).__name__ == "NoResponseError":
+            return 503, None  # the request went out and nothing came back
         status_code = getattr(error, "status_code", None)
-        if status_code is None:
-            return 503, None  # NoResponseError: nothing came back
+        if not isinstance(status_code, int):
+            return None
         if status_code in _TRANSIENT_UPSTREAM_STATUSES or status_code >= 500:
             headers = getattr(error, "headers", None)
             retry_after = headers.get("retry-after") if headers is not None else None
             return 503, retry_after
-        if status_code in (401, 403):
+        if status_code in (401, 403) or status_code < 400:
             return 502, None
         return None
     return None
